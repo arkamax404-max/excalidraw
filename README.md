@@ -39,6 +39,8 @@ Application URL:
 - Delete diagrams from PostgreSQL
 - Compact storage panel integrated into the top bar
 - Dedicated logout action inside the storage panel
+- Display name shown in the storage panel instead of the raw username
+- Admin-only user management from the Excalidraw hamburger menu
 - JSON backup copies written to `data\<username>\`
 
 ## PostgreSQL configuration
@@ -59,6 +61,14 @@ The container connects to the same PostgreSQL host through `host.docker.internal
 - Passwords are stored as bcrypt hashes
 - Sessions are stored in PostgreSQL through `connect-pg-simple`
 - The application uses the `excalidraw.sid` cookie for authenticated requests
+- Users support `display_name` and `last_login_at`
+
+## Admin user management
+
+- If the logged-in user is `admin`, the hamburger menu shows a user management entry
+- Admins can create, edit, deactivate, and delete users
+- The admin panel shows each user's last login timestamp and diagram count
+- The login session stores whether the authenticated user has admin privileges
 
 ## Manual user provisioning
 

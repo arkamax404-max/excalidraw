@@ -8,11 +8,21 @@ import "@excalidraw/excalidraw/index.css";
 import "./App.css";
 
 const DEFAULT_FILE_NAME = "diagrama-1";
+const ADMIN_FORM_INITIAL_STATE = {
+  id: null,
+  username: "",
+  displayName: "",
+  password: "",
+  isActive: true,
+};
 
 const createStatus = (kind = "info", message = "Listo.") => ({
   kind,
   message,
 });
+
+const formatTimestamp = (value) =>
+  value ? new Date(value).toLocaleString("es-ES") : "Nunca";
 
 async function parseApiResponse(response) {
   const contentType = response.headers.get("content-type") || "";
@@ -39,17 +49,27 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [panelOpen, setPanelOpen] = useState(true);
   const [status, setStatus] = useState(createStatus());
+  const [adminPanelOpen, setAdminPanelOpen] = useState(false);
+  const [adminUsers, setAdminUsers] = useState([]);
+  const [adminBusy, setAdminBusy] = useState(false);
+  const [adminStatus, setAdminStatus] = useState(createStatus());
+  const [adminForm, setAdminForm] = useState(ADMIN_FORM_INITIAL_STATE);
 
   const currentFileName = useMemo(() => {
     const trimmedValue = fileName.trim();
     return trimmedValue || DEFAULT_FILE_NAME;
   }, [fileName]);
 
+  const isAdmin = authUser?.isAdmin === true;
+
   const handleUnauthorized = useCallback((message = "Tu sesion ha expirado.") => {
     setAuthUser(null);
     setAvailableFiles([]);
     setFileName(DEFAULT_FILE_NAME);
     setPanelOpen(true);
+    setAdminPanelOpen(false);
+    setAdminUsers([]);
+    setAdminForm(ADMIN_FORM_INITIAL_STATE);
     setStatus(createStatus("error", message));
   }, []);
 
@@ -101,6 +121,26 @@ function App() {
     }
   }, [apiRequest, authUser]);
 
+  const refreshAdminUsers = useCallback(async () => {
+    if (!authUser?.isAdmin) {
+      setAdminUsers([]);
+      return;
+    }
+
+    setAdminBusy(true);
+
+    try {
+      const payload = await apiRequest("/api/admin/users");
+      setAdminUsers(payload?.users ?? []);
+    } catch (error) {
+      if (error.status !== 401) {
+        setAdminStatus(createStatus("error", error.message));
+      }
+    } finally {
+      setAdminBusy(false);
+    }
+  }, [apiRequest, authUser]);
+
   useEffect(() => {
     const checkSession = async () => {
       try {
@@ -129,6 +169,12 @@ function App() {
     }
   }, [authUser, refreshFiles]);
 
+  useEffect(() => {
+    if (adminPanelOpen && authUser?.isAdmin) {
+      void refreshAdminUsers();
+    }
+  }, [adminPanelOpen, authUser, refreshAdminUsers]);
+
   const login = useCallback(
     async (event) => {
       event.preventDefault();
@@ -143,6 +189,9 @@ function App() {
 
         setAuthUser(payload.user);
         setAuthForm({ username: "", password: "" });
+        setAdminUsers([]);
+        setAdminForm(ADMIN_FORM_INITIAL_STATE);
+        setAdminPanelOpen(false);
         setStatus(createStatus("success", `Sesion iniciada como ${payload.user.username}.`));
       } catch (error) {
         setAuthError(error.message);
@@ -162,6 +211,9 @@ function App() {
       setAvailableFiles([]);
       setFileName(DEFAULT_FILE_NAME);
       setPanelOpen(true);
+      setAdminPanelOpen(false);
+      setAdminUsers([]);
+      setAdminForm(ADMIN_FORM_INITIAL_STATE);
       setStatus(createStatus("info", "Sesion cerrada."));
     } catch (error) {
       setStatus(createStatus("error", error.message));
@@ -280,15 +332,112 @@ function App() {
     setStatus(createStatus("info", "Lienzo reiniciado."));
   }, [excalidrawAPI]);
 
+  const resetAdminForm = useCallback(() => {
+    setAdminForm(ADMIN_FORM_INITIAL_STATE);
+  }, []);
+
+  const submitAdminUser = useCallback(
+    async (event) => {
+      event.preventDefault();
+
+      if (!isAdmin) {
+        return;
+      }
+
+      const creatingUser = adminForm.id === null;
+      setAdminBusy(true);
+      setAdminStatus(
+        createStatus("info", creatingUser ? "Creando usuario..." : "Actualizando usuario..."),
+      );
+
+      try {
+        const payload = {
+          displayName: adminForm.displayName,
+          isActive: adminForm.isActive,
+        };
+
+        if (creatingUser) {
+          payload.username = adminForm.username;
+          payload.password = adminForm.password;
+        } else if (adminForm.password) {
+          payload.password = adminForm.password;
+        }
+
+        await apiRequest(
+          creatingUser
+            ? "/api/admin/users"
+            : `/api/admin/users/${encodeURIComponent(adminForm.id)}`,
+          {
+            method: creatingUser ? "POST" : "PUT",
+            body: JSON.stringify(payload),
+          },
+        );
+
+        resetAdminForm();
+        await refreshAdminUsers();
+        setAdminStatus(
+          createStatus(
+            "success",
+            creatingUser ? "Usuario creado correctamente." : "Usuario actualizado correctamente.",
+          ),
+        );
+      } catch (error) {
+        setAdminStatus(createStatus("error", error.message));
+      } finally {
+        setAdminBusy(false);
+      }
+    },
+    [adminForm, apiRequest, isAdmin, refreshAdminUsers, resetAdminForm],
+  );
+
+  const editAdminUser = useCallback((user) => {
+    setAdminForm({
+      id: user.id,
+      username: user.username,
+      displayName: user.displayName === user.username ? "" : user.displayName,
+      password: "",
+      isActive: user.isActive,
+    });
+    setAdminPanelOpen(true);
+    setAdminStatus(createStatus("info", `Editando ${user.username}.`));
+  }, []);
+
+  const deleteAdminUser = useCallback(
+    async (user) => {
+      if (!window.confirm(`Se eliminara el usuario ${user.username} y todos sus diagramas. Continuar?`)) {
+        return;
+      }
+
+      setAdminBusy(true);
+      setAdminStatus(createStatus("info", `Eliminando ${user.username}...`));
+
+      try {
+        await apiRequest(`/api/admin/users/${encodeURIComponent(user.id)}`, {
+          method: "DELETE",
+        });
+        if (adminForm.id === user.id) {
+          resetAdminForm();
+        }
+        await refreshAdminUsers();
+        setAdminStatus(createStatus("success", `${user.username} eliminado.`));
+      } catch (error) {
+        setAdminStatus(createStatus("error", error.message));
+      } finally {
+        setAdminBusy(false);
+      }
+    },
+    [adminForm.id, apiRequest, refreshAdminUsers, resetAdminForm],
+  );
+
   const renderTopRightUI = useCallback(
     () => (
-      <button
-        type="button"
-        className={`sidebar-trigger default-sidebar-trigger${panelOpen ? " active" : ""}`}
-        onClick={() => setPanelOpen((currentValue) => !currentValue)}
-        title="Mostrar u ocultar panel de guardado en servidor"
-        aria-label="Mostrar u ocultar panel de guardado en servidor"
-      >
+        <button
+          type="button"
+          className={`sidebar-trigger default-sidebar-trigger${panelOpen ? " active" : ""}`}
+          onClick={() => setPanelOpen((currentValue) => !currentValue)}
+          title="Mostrar u ocultar panel"
+          aria-label="Mostrar u ocultar panel"
+        >
         <svg className="topbar-storage-icon" viewBox="0 0 24 24" aria-hidden="true">
           <path d="M5 3h11l3 3v13a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Zm0 2v14h12V7.5L15.5 5H15v4H7V5Zm4 0v2h4V5Zm-2 8h8v4H7v-4Z" />
         </svg>
@@ -354,6 +503,18 @@ function App() {
           <button className="login-submit" type="submit" disabled={authBusy}>
             {authBusy ? "Entrando..." : "Entrar"}
           </button>
+
+          <p className="login-footnote">
+            Este proyecto es un fork de{" "}
+            <a
+              href="https://github.com/excalidraw/excalidraw"
+              target="_blank"
+              rel="noreferrer"
+            >
+              Excalidraw
+            </a>
+            , el proyecto open source original.
+          </p>
         </form>
       </div>
     );
@@ -373,13 +534,31 @@ function App() {
             },
           }}
         >
-          <MainMenu />
+          <MainMenu>
+            {isAdmin ? (
+              <>
+                <MainMenu.Item onSelect={() => setAdminPanelOpen(true)}>
+                  Gestion de usuarios
+                </MainMenu.Item>
+                <MainMenu.Separator />
+              </>
+            ) : null}
+            <MainMenu.DefaultItems.LoadScene />
+            <MainMenu.DefaultItems.SaveToActiveFile />
+            <MainMenu.DefaultItems.Export />
+            <MainMenu.DefaultItems.SaveAsImage />
+            <MainMenu.DefaultItems.CommandPalette />
+            <MainMenu.DefaultItems.Help />
+            <MainMenu.DefaultItems.ClearCanvas />
+            <MainMenu.Separator />
+            <MainMenu.DefaultItems.ToggleTheme />
+          </MainMenu>
         </Excalidraw>
 
         {panelOpen ? (
           <section className="storage-panel">
             <div className="storage-panel-header">
-              <span className="storage-user-badge">{authUser.username}</span>
+              <span className="storage-user-badge">{authUser.displayName}</span>
               <div className="storage-panel-header-actions">
                 <button
                   type="button"
@@ -463,6 +642,188 @@ function App() {
             </div>
 
             <p className={`status status-${status.kind}`}>{status.message}</p>
+          </section>
+        ) : null}
+
+        {adminPanelOpen && isAdmin ? (
+          <section className="admin-panel-overlay">
+            <div className="admin-panel">
+              <div className="admin-panel-header">
+                <div>
+                  <h1>Gestion de usuarios</h1>
+                  <p>Administra acceso, actividad y contenido por usuario.</p>
+                </div>
+                <button
+                  type="button"
+                  className="panel-toggle"
+                  onClick={() => {
+                    setAdminPanelOpen(false);
+                    resetAdminForm();
+                  }}
+                  aria-label="Cerrar gestion de usuarios"
+                  title="Cerrar gestion de usuarios"
+                >
+                  ×
+                </button>
+              </div>
+
+              <div className="admin-panel-grid">
+                <form className="admin-form" onSubmit={submitAdminUser}>
+                  <div className="section-heading">
+                    <h2>{adminForm.id === null ? "Nuevo usuario" : "Editar usuario"}</h2>
+                  </div>
+
+                  <label className="login-field">
+                    <span>Usuario</span>
+                    <input
+                      value={adminForm.username}
+                      onChange={(event) =>
+                        setAdminForm((currentValue) => ({
+                          ...currentValue,
+                          username: event.target.value,
+                        }))
+                      }
+                      placeholder="usuario"
+                      disabled={adminForm.id !== null || adminBusy}
+                      required
+                    />
+                  </label>
+
+                  <label className="login-field">
+                    <span>Nombre visible</span>
+                    <input
+                      value={adminForm.displayName}
+                      onChange={(event) =>
+                        setAdminForm((currentValue) => ({
+                          ...currentValue,
+                          displayName: event.target.value,
+                        }))
+                      }
+                      placeholder="Opcional"
+                      disabled={adminBusy}
+                    />
+                  </label>
+
+                  <label className="login-field">
+                    <span>
+                      {adminForm.id === null
+                        ? "Password"
+                        : "Nueva password"}
+                    </span>
+                    <input
+                      type="password"
+                      value={adminForm.password}
+                      onChange={(event) =>
+                        setAdminForm((currentValue) => ({
+                          ...currentValue,
+                          password: event.target.value,
+                        }))
+                      }
+                      placeholder={adminForm.id === null ? "Minimo 8 caracteres" : "Dejar en blanco para mantenerla"}
+                      disabled={adminBusy}
+                      required={adminForm.id === null}
+                    />
+                  </label>
+
+                  <label className="admin-checkbox">
+                    <input
+                      type="checkbox"
+                      checked={adminForm.isActive}
+                      onChange={(event) =>
+                        setAdminForm((currentValue) => ({
+                          ...currentValue,
+                          isActive: event.target.checked,
+                        }))
+                      }
+                      disabled={adminBusy || adminForm.id === authUser.id}
+                    />
+                    <span>Usuario activo</span>
+                  </label>
+
+                  <div className="admin-form-actions">
+                    <button type="submit" disabled={adminBusy}>
+                      {adminForm.id === null ? "Crear usuario" : "Guardar cambios"}
+                    </button>
+                    <button
+                      type="button"
+                      className="admin-secondary-button"
+                      onClick={resetAdminForm}
+                      disabled={adminBusy}
+                    >
+                      Limpiar
+                    </button>
+                    <button
+                      type="button"
+                      className="admin-secondary-button"
+                      onClick={() => void refreshAdminUsers()}
+                      disabled={adminBusy}
+                    >
+                      Recargar
+                    </button>
+                  </div>
+                </form>
+
+                <div className="admin-user-list">
+                  <div className="section-heading">
+                    <h2>Usuarios</h2>
+                    <span className="storage-panel-count">{adminUsers.length}</span>
+                  </div>
+
+                  {adminUsers.length === 0 ? (
+                    <p className="empty-state">No hay usuarios registrados.</p>
+                  ) : (
+                    <ul className="admin-user-items">
+                      {adminUsers.map((user) => (
+                        <li key={user.id} className="admin-user-card">
+                          <div className="admin-user-card-header">
+                            <div>
+                              <strong>{user.username}</strong>
+                              <span className={`admin-user-state${user.isActive ? "" : " is-inactive"}`}>
+                                {user.isActive ? "Activo" : "Inactivo"}
+                              </span>
+                            </div>
+                            <div className="admin-user-card-actions">
+                              <button
+                                type="button"
+                                className="admin-secondary-button"
+                                onClick={() => editAdminUser(user)}
+                                disabled={adminBusy}
+                              >
+                                Editar
+                              </button>
+                              <button
+                                type="button"
+                                className="admin-danger-button"
+                                onClick={() => void deleteAdminUser(user)}
+                                disabled={adminBusy || user.id === authUser.id}
+                              >
+                                Eliminar
+                              </button>
+                            </div>
+                          </div>
+                          <dl className="admin-user-metadata">
+                            <div>
+                              <dt>Nombre</dt>
+                              <dd>{user.displayName}</dd>
+                            </div>
+                            <div>
+                              <dt>Ultimo login</dt>
+                              <dd>{formatTimestamp(user.lastLoginAt)}</dd>
+                            </div>
+                            <div>
+                              <dt>Diagramas</dt>
+                              <dd>{user.diagramCount}</dd>
+                            </div>
+                          </dl>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              </div>
+
+              <p className={`status status-${adminStatus.kind}`}>{adminStatus.message}</p>
+            </div>
           </section>
         ) : null}
       </main>

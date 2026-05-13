@@ -55,10 +55,14 @@ const fileNameFromName = (name) => `${sanitizeBaseName(name)}${FILE_EXTENSION}`;
 const filePathFromName = (username, name) =>
   path.join(DATA_DIR, sanitizeBaseName(username), fileNameFromName(name));
 
+const sanitizeUsername = (value) => String(value || "").trim();
+const isAdminUser = (user) => user?.username === "admin";
+
 const createSessionUser = (user) => ({
   id: user.id,
   username: user.username,
   displayName: user.display_name ?? user.username,
+  isAdmin: isAdminUser(user),
 });
 
 const ensureDataDir = async () => {
@@ -69,6 +73,13 @@ const ensureUserDataDir = async (username) => {
   const userDir = path.join(DATA_DIR, sanitizeBaseName(username));
   await fs.mkdir(userDir, { recursive: true });
   return userDir;
+};
+
+const deleteUserDataDir = async (username) => {
+  await fs.rm(path.join(DATA_DIR, sanitizeBaseName(username)), {
+    recursive: true,
+    force: true,
+  });
 };
 
 const writeDiagramBackup = async (username, name, scene) => {
@@ -105,9 +116,14 @@ const bootstrapDatabase = async () => {
         password_hash TEXT NOT NULL,
         display_name TEXT,
         is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        last_login_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
+    `);
+    await client.query(`
+      ALTER TABLE ${DB_SCHEMA}.users
+      ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ
     `);
     await client.query(`
       CREATE TABLE IF NOT EXISTS ${DB_SCHEMA}.diagrams (
@@ -143,6 +159,31 @@ const requireAuth = (request, response, next) => {
 
   next();
 };
+
+const requireAdmin = (request, response, next) => {
+  if (!request.session?.user) {
+    response.status(401).json({ error: "Necesitas iniciar sesion." });
+    return;
+  }
+
+  if (!request.session.user.isAdmin) {
+    response.status(403).json({ error: "Necesitas permisos de administrador." });
+    return;
+  }
+
+  next();
+};
+
+const getUserListItem = (user) => ({
+  id: user.id,
+  username: user.username,
+  displayName: user.display_name ?? user.username,
+  isActive: user.is_active,
+  lastLoginAt: user.last_login_at ? user.last_login_at.toISOString() : null,
+  createdAt: user.created_at.toISOString(),
+  updatedAt: user.updated_at.toISOString(),
+  diagramCount: Number(user.diagram_count ?? 0),
+});
 
 await ensureDataDir();
 await bootstrapDatabase();
@@ -219,13 +260,24 @@ app.post("/api/auth/login", async (request, response, next) => {
       return;
     }
 
+    const loginUpdateResult = await pool.query(
+      `
+        UPDATE ${DB_SCHEMA}.users
+        SET last_login_at = NOW()
+        WHERE id = $1
+        RETURNING id, username, display_name, last_login_at
+      `,
+      [user.id],
+    );
+    const sessionUser = createSessionUser(loginUpdateResult.rows[0] ?? user);
+
     request.session.regenerate((sessionError) => {
       if (sessionError) {
         next(sessionError);
         return;
       }
 
-      request.session.user = createSessionUser(user);
+      request.session.user = sessionUser;
       request.session.save((saveError) => {
         if (saveError) {
           next(saveError);
@@ -237,6 +289,187 @@ app.post("/api/auth/login", async (request, response, next) => {
           user: request.session.user,
         });
       });
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/users", requireAdmin, async (_request, response, next) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        users.id,
+        users.username,
+        users.display_name,
+        users.is_active,
+        users.last_login_at,
+        users.created_at,
+        users.updated_at,
+        COUNT(diagrams.id) AS diagram_count
+      FROM ${DB_SCHEMA}.users AS users
+      LEFT JOIN ${DB_SCHEMA}.diagrams AS diagrams
+        ON diagrams.user_id = users.id
+      GROUP BY users.id
+      ORDER BY users.username ASC
+    `);
+
+    response.json({
+      users: result.rows.map(getUserListItem),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/admin/users", requireAdmin, async (request, response, next) => {
+  const username = sanitizeUsername(request.body?.username);
+  const password = String(request.body?.password || "");
+  const displayName = String(request.body?.displayName || "").trim() || null;
+  const isActive = request.body?.isActive !== false;
+
+  if (!/^[A-Za-z0-9._-]{3,50}$/.test(username)) {
+    response.status(400).json({
+      error:
+        "El usuario debe tener entre 3 y 50 caracteres y solo usar letras, numeros, punto, guion y guion bajo.",
+    });
+    return;
+  }
+
+  if (password.length < 8) {
+    response.status(400).json({
+      error: "La password debe tener al menos 8 caracteres.",
+    });
+    return;
+  }
+
+  try {
+    const passwordHash = await bcrypt.hash(password, 12);
+    const result = await pool.query(
+      `
+        INSERT INTO ${DB_SCHEMA}.users (username, password_hash, display_name, is_active)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id, username, display_name, is_active, last_login_at, created_at, updated_at
+      `,
+      [username, passwordHash, displayName, isActive],
+    );
+
+    response.status(201).json({
+      ok: true,
+      user: {
+        ...getUserListItem({ ...result.rows[0], diagram_count: 0 }),
+      },
+    });
+  } catch (error) {
+    if (error.code === "23505") {
+      response.status(409).json({ error: "Ese usuario ya existe." });
+      return;
+    }
+
+    next(error);
+  }
+});
+
+app.put("/api/admin/users/:id", requireAdmin, async (request, response, next) => {
+  const userId = Number(request.params.id);
+  const displayName = String(request.body?.displayName || "").trim() || null;
+  const password = String(request.body?.password || "");
+  const isActive = Boolean(request.body?.isActive);
+
+  if (!Number.isInteger(userId) || userId <= 0) {
+    response.status(400).json({ error: "El identificador de usuario no es valido." });
+    return;
+  }
+
+  if (request.session.user.id === userId && !isActive) {
+    response.status(400).json({ error: "No puedes desactivar tu propio usuario." });
+    return;
+  }
+
+  if (password && password.length < 8) {
+    response.status(400).json({
+      error: "La password debe tener al menos 8 caracteres.",
+    });
+    return;
+  }
+
+  try {
+    const existingUserResult = await pool.query(
+      `
+        SELECT id
+        FROM ${DB_SCHEMA}.users
+        WHERE id = $1
+      `,
+      [userId],
+    );
+
+    if (existingUserResult.rowCount === 0) {
+      response.status(404).json({ error: "El usuario solicitado no existe." });
+      return;
+    }
+
+    const passwordHash = password ? await bcrypt.hash(password, 12) : null;
+    const result = await pool.query(
+      `
+        UPDATE ${DB_SCHEMA}.users
+        SET
+          display_name = $2,
+          is_active = $3,
+          password_hash = COALESCE($4, password_hash),
+          updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, username, display_name, is_active, last_login_at, created_at, updated_at
+      `,
+      [userId, displayName, isActive, passwordHash],
+    );
+
+    response.json({
+      ok: true,
+      user: {
+        ...getUserListItem({ ...result.rows[0], diagram_count: 0 }),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete("/api/admin/users/:id", requireAdmin, async (request, response, next) => {
+  const userId = Number(request.params.id);
+
+  if (!Number.isInteger(userId) || userId <= 0) {
+    response.status(400).json({ error: "El identificador de usuario no es valido." });
+    return;
+  }
+
+  if (request.session.user.id === userId) {
+    response.status(400).json({ error: "No puedes eliminar tu propio usuario." });
+    return;
+  }
+
+  try {
+    const result = await pool.query(
+      `
+        DELETE FROM ${DB_SCHEMA}.users
+        WHERE id = $1
+        RETURNING id, username
+      `,
+      [userId],
+    );
+
+    if (result.rowCount === 0) {
+      response.status(404).json({ error: "El usuario solicitado no existe." });
+      return;
+    }
+
+    await deleteUserDataDir(result.rows[0].username);
+
+    response.json({
+      ok: true,
+      user: {
+        id: result.rows[0].id,
+        username: result.rows[0].username,
+      },
     });
   } catch (error) {
     next(error);

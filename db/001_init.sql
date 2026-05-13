@@ -6,9 +6,13 @@ CREATE TABLE IF NOT EXISTS excalidraw.users (
   password_hash TEXT NOT NULL,
   display_name TEXT,
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  last_login_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE excalidraw.users
+  ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS excalidraw.diagrams (
   id BIGSERIAL PRIMARY KEY,
