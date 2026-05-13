@@ -1,0 +1,286 @@
+.app-shell {
+  height: 100vh;
+  background: #f5f5f8;
+  color: #1f1f27;
+}
+
+.storage-primary-row button,
+.storage-secondary-row button,
+.file-button {
+  border: none;
+  border-radius: 9px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.storage-primary-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.5rem;
+}
+
+.storage-primary-row button {
+  padding: 0.62rem 0.85rem;
+  background: #4f46e5;
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.storage-secondary-row {
+  display: flex;
+  gap: 0.45rem;
+}
+
+.storage-secondary-row button {
+  padding: 0.42rem 0.72rem;
+  background: #f3f4f6;
+  color: #374151;
+  border: 1px solid #e5e7eb;
+}
+
+.storage-primary-row button:disabled,
+.storage-secondary-row button:disabled,
+.file-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.empty-state {
+  color: #6b7280;
+  font-size: 0.88rem;
+}
+
+.file-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  overflow: auto;
+}
+
+.file-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 2.35rem;
+  gap: 0.35rem;
+  align-items: stretch;
+}
+
+.file-button {
+  width: 100%;
+  text-align: left;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.62rem 0.72rem;
+  min-height: 2.35rem;
+  background: #f9fafb;
+  border: 1px solid #eceff3;
+}
+
+.file-delete-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.35rem;
+  min-height: 2.35rem;
+  height: 100%;
+  padding: 0;
+  border: 1px solid #eceff3;
+  border-radius: 9px;
+  background: #f9fafb;
+  color: #6b7280;
+  cursor: pointer;
+}
+
+.file-delete-button:hover {
+  background: #fef2f2;
+  color: #b91c1c;
+  border-color: #fecaca;
+}
+
+.file-delete-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.file-delete-button svg {
+  width: 0.95rem;
+  height: 0.95rem;
+  fill: currentColor;
+}
+
+.file-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+  font-size: 0.92rem;
+  color: #111827;
+}
+
+.file-button small {
+  white-space: nowrap;
+  font-size: 0.75rem;
+  color: #6b7280;
+}
+
+.status {
+  margin-top: auto;
+  padding: 0.65rem 0.72rem;
+  border-radius: 10px;
+  font-size: 0.82rem;
+}
+
+.status-info {
+  background: #eef2ff;
+  color: #3730a3;
+}
+
+.status-success {
+  background: #ecfdf5;
+  color: #166534;
+}
+
+.status-error {
+  background: #fef2f2;
+  color: #991b1b;
+}
+
+.editor-shell {
+  position: relative;
+  min-width: 0;
+}
+
+.editor-shell .excalidraw {
+  height: 100vh;
+}
+
+.storage-panel {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+  width: min(320px, calc(100vw - 2rem));
+  max-height: calc(100vh - 2rem);
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 0.8rem;
+  border: 1px solid rgba(148, 163, 184, 0.55);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 14px 30px rgba(15, 23, 42, 0.12);
+  backdrop-filter: blur(8px);
+  z-index: 20;
+}
+
+.storage-panel h1,
+.storage-panel h2,
+.storage-panel p {
+  margin: 0;
+}
+
+.storage-panel h1 {
+  font-size: 0.96rem;
+  font-weight: 600;
+}
+
+.storage-panel h2 {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #6b7280;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.storage-panel input {
+  width: 100%;
+  min-width: 0;
+  padding: 0.62rem 0.72rem;
+  border: 1px solid #d1d5db;
+  border-radius: 9px;
+  font: inherit;
+  background: #ffffff;
+}
+
+.storage-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.storage-panel-heading {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.storage-panel-heading span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.4rem;
+  height: 1.4rem;
+  padding: 0 0.35rem;
+  border-radius: 999px;
+  background: #f3f4f6;
+  color: #4b5563;
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.storage-panel-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  min-height: 0;
+}
+
+.panel-toggle {
+  border: 1px solid #e5e7eb;
+  border-radius: 999px;
+  background: #f9fafb;
+  color: #6b7280;
+  width: 1.9rem;
+  height: 1.9rem;
+  padding: 0;
+  cursor: pointer;
+  font-size: 1.15rem;
+  line-height: 1;
+}
+
+.topbar-storage-icon {
+  width: 1rem;
+  height: 1rem;
+  fill: currentColor;
+}
+
+.storage-panel .file-list {
+  max-height: min(34vh, 15rem);
+}
+
+@media (max-width: 960px) {
+  .storage-panel {
+    top: auto;
+    right: 0.75rem;
+    left: 0.75rem;
+    bottom: 0.75rem;
+    width: auto;
+    max-height: min(52vh, 28rem);
+  }
+
+  .file-list {
+    max-height: 14rem;
+  }
+}

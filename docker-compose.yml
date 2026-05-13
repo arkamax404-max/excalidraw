@@ -1,0 +1,14 @@
+services:
+  excalidraw:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: excalidraw
+    restart: unless-stopped
+    environment:
+      PORT: 3030
+      DATA_DIR: /data
+    ports:
+      - "3030:3030"
+    volumes:
+      - ./data:/data
