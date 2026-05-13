@@ -8,6 +8,15 @@ services:
     environment:
       PORT: 3030
       DATA_DIR: /data
+      PGHOST: host.docker.internal
+      PGPORT: 5433
+      PGDATABASE: postgres
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGSCHEMA: excalidraw
+      SESSION_SECRET: change-me-in-production
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "3030:3030"
     volumes:

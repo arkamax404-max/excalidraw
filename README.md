@@ -1,13 +1,14 @@
-# Excalidraw local storage
+# Excalidraw authenticated storage
 
-Customized self-hosted Excalidraw deployment with server-side file storage.
+Customized self-hosted Excalidraw deployment with user authentication, PostgreSQL persistence, and per-user diagram isolation.
 
 ## What this project includes
 
 - Excalidraw embedded in a custom React app
-- Express backend to list, save, load, and delete diagrams
+- Express backend with login, sessions, and per-user diagram storage
 - Dockerized deployment
-- Persistent PostgreSQL-independent local file storage for diagrams
+- PostgreSQL-backed users, sessions, and diagrams
+- Optional JSON backup copies in the runtime `data/` folder
 - Apache reverse proxy publication through `excalidraw.arkamax.es`
 
 ## Project structure
@@ -15,9 +16,10 @@ Customized self-hosted Excalidraw deployment with server-side file storage.
 - `docker-compose.yml`: container orchestration
 - `Dockerfile`: production image build
 - `app/`: frontend and backend application
-- `data/`: local diagram storage at runtime
+- `db/`: SQL bootstrap and admin helpers
+- `data/`: runtime backup copies of diagrams
 
-## Local run
+## Run
 
 ```powershell
 cd C:\docker\excalidraw
@@ -30,13 +32,55 @@ Application URL:
 
 ## Features added on top of standard Excalidraw
 
-- Save diagrams to the server
-- Load saved diagrams from the server
-- Delete saved diagrams from the server
+- Login required before entering the editor
+- Per-user diagram isolation
+- Save diagrams to PostgreSQL
+- Load diagrams from PostgreSQL
+- Delete diagrams from PostgreSQL
 - Compact storage panel integrated into the top bar
+- Dedicated logout action inside the storage panel
+- JSON backup copies written to `data\<username>\`
+
+## PostgreSQL configuration
+
+Current deployment values:
+
+- external host: `192.168.1.222`
+- port: `5433`
+- database: `postgres`
+- user: `postgres`
+- schema: `excalidraw`
+
+The container connects to the same PostgreSQL host through `host.docker.internal`. Replace the default password and `SESSION_SECRET` before production use.
+
+## Authentication flow
+
+- Users are created manually in PostgreSQL
+- Passwords are stored as bcrypt hashes
+- Sessions are stored in PostgreSQL through `connect-pg-simple`
+- The application uses the `excalidraw.sid` cookie for authenticated requests
+
+## Manual user provisioning
+
+Generate a password hash:
+
+```powershell
+cd C:\docker\excalidraw\app
+npm run hash-password -- your-password
+```
+
+Then insert the user manually with the generated hash using `db\create-user.example.sql` as a template.
+
+## Reverse proxy
+
+Apache/XAMPP publishes the service at:
+
+- `https://excalidraw.arkamax.es`
+
+The vhost proxies traffic to the local container on `http://127.0.0.1:3030`.
 
 ## Notes
 
-- Diagrams are stored as `.excalidraw.json` files.
+- Diagrams are stored in PostgreSQL and also written as `.excalidraw.json` backup copies under `data/<username>/`.
 - The `data/` runtime folder is ignored from git.
 - For internet publishing, Apache proxies `excalidraw.arkamax.es` to the local container.
