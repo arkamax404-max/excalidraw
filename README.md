@@ -100,7 +100,7 @@ The server reads these environment variables:
 | `OPENROUTER_API_KEY` | none | Server-only OpenRouter credential required for AI generation |
 | `GROQ_API_KEY` | none | Server-only Groq credential used when OpenRouter is unavailable |
 | `GROQ_MODEL` | `openai/gpt-oss-20b` | Validated server-side Groq model override |
-| `GROQ_MODELS` | none | Optional comma-separated Groq fallback chain; overrides `GROQ_MODEL` when non-empty |
+| `GROQ_MODELS` | none | Optional comma-separated Groq fallback chain; completely replaces the compiled default chain and overrides `GROQ_MODEL` when non-empty |
 
 Docker Compose overrides some server defaults; treat `docker-compose.yml` as the source of truth for the container deployment.
 
@@ -126,7 +126,15 @@ The browser calls only the authenticated local endpoint. The server first reques
 3. `qwen/qwen3.6-27b`
 4. `qwen/qwen3.8-27b`
 
-`GROQ_MODEL` remains backward compatible as the preferred first model, followed by the remaining defaults. A valid, non-empty `GROQ_MODELS` defines the complete ordered chain instead. Both forms are deduplicated and capped at four validated model IDs. Invalid configuration stops before any provider request.
+These four IDs are compiled defaults in `app/openrouter.mjs`; the application does not discover or refresh Groq models automatically. Groq availability is account-specific and can change, so treat this list as a safe fallback rather than a guarantee that every model is enabled for every account.
+
+`GROQ_MODEL` remains backward compatible as the preferred first model, followed by the remaining compiled defaults. A valid, non-empty `GROQ_MODELS` defines the complete ordered chain instead. Both forms are deduplicated and capped at four validated model IDs. Invalid configuration stops before any provider request.
+
+For example, this `app/.env` value replaces the compiled chain and tries only the listed models in this order:
+
+```dotenv
+GROQ_MODELS=openai/gpt-oss-20b,openai/gpt-oss-120b
+```
 
 Each Groq attempt has its own timeout and the whole Groq chain has a shared deadline, so unavailable models cannot multiply the wait indefinitely. Credential rejection stops the chain immediately; model availability, provider, rate-limit, timeout, and malformed-output failures may continue to the next model. Invalid prompts are never sent to either provider. Returned Mermaid is validated before the browser converts it to Excalidraw elements beside the existing scene.
 
