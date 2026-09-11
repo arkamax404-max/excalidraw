@@ -6,6 +6,11 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
+import {
+  OpenRouterError,
+  createGenerationRateLimiter,
+  generateMermaidWithFallback,
+} from "./openrouter.mjs";
 
 const { Pool } = pg;
 
@@ -20,6 +25,7 @@ const FILE_EXTENSION = ".excalidraw.json";
 const DB_SCHEMA = process.env.PGSCHEMA || "excalidraw";
 const SESSION_SECRET = process.env.SESSION_SECRET || "change-me-in-production";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7;
+const checkGenerationRateLimit = createGenerationRateLimiter();
 
 const pool = new Pool({
   host: process.env.PGHOST || "127.0.0.1",
@@ -491,6 +497,35 @@ app.post("/api/auth/logout", (request, response, next) => {
     response.clearCookie("excalidraw.sid");
     response.json({ ok: true });
   });
+});
+
+app.post("/api/ai/diagram", requireAuth, async (request, response) => {
+  const retryAfter = checkGenerationRateLimit(String(request.session.user.id));
+  if (retryAfter > 0) {
+    response.set("Retry-After", String(retryAfter));
+    response.status(429).json({
+      error: "Too many AI generation requests. Try again shortly.",
+    });
+    return;
+  }
+
+  try {
+    const result = await generateMermaidWithFallback({
+      prompt: request.body?.prompt,
+      openRouterApiKey: process.env.OPENROUTER_API_KEY,
+      groqApiKey: process.env.GROQ_API_KEY,
+      groqModel: process.env.GROQ_MODEL,
+      groqModels: process.env.GROQ_MODELS,
+    });
+    response.json(result);
+  } catch (error) {
+    if (error instanceof OpenRouterError) {
+      response.status(error.status).json({ error: error.message });
+      return;
+    }
+
+    response.status(502).json({ error: "AI generation failed unexpectedly." });
+  }
 });
 
 app.get("/api/files", requireAuth, async (request, response, next) => {

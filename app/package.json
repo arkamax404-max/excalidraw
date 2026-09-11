@@ -7,11 +7,13 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
+    "test": "node --test",
     "start": "node server.mjs",
     "hash-password": "node scripts/hash-password.mjs"
   },
   "dependencies": {
     "@excalidraw/excalidraw": "^0.18.0",
+    "@excalidraw/mermaid-to-excalidraw": "2.2.2",
     "bcryptjs": "^3.0.3",
     "connect-pg-simple": "^10.0.0",
     "express": "^5.1.0",

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Excalidraw,
   MainMenu,
@@ -6,6 +6,9 @@ import {
 } from "@excalidraw/excalidraw";
 import "@excalidraw/excalidraw/index.css";
 import "./App.css";
+import { excalidrawToMermaid } from "./mermaid/excalidrawToMermaid.js";
+import { toMermaidDownloadFilename } from "./mermaid/mermaidFilename.js";
+import { convertAndInsertMermaid } from "./ai/mermaidToScene.js";
 
 const DEFAULT_FILE_NAME = "diagrama-1";
 const ADMIN_FORM_INITIAL_STATE = {
@@ -54,6 +57,11 @@ function App() {
   const [adminBusy, setAdminBusy] = useState(false);
   const [adminStatus, setAdminStatus] = useState(createStatus());
   const [adminForm, setAdminForm] = useState(ADMIN_FORM_INITIAL_STATE);
+  const [aiDialogOpen, setAiDialogOpen] = useState(false);
+  const [aiPrompt, setAiPrompt] = useState("");
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiError, setAiError] = useState("");
+  const aiAbortController = useRef(null);
 
   const currentFileName = useMemo(() => {
     const trimmedValue = fileName.trim();
@@ -332,6 +340,64 @@ function App() {
     setStatus(createStatus("info", "Lienzo reiniciado."));
   }, [excalidrawAPI]);
 
+  const closeAiDialog = useCallback(() => {
+    aiAbortController.current?.abort();
+    aiAbortController.current = null;
+    setAiBusy(false);
+    setAiDialogOpen(false);
+    setAiError("");
+  }, []);
+
+  const generateDiagram = useCallback(
+    async (event) => {
+      event.preventDefault();
+      if (!excalidrawAPI || aiBusy) {
+        return;
+      }
+
+      const controller = new AbortController();
+      aiAbortController.current = controller;
+      setAiBusy(true);
+      setAiError("");
+
+      try {
+        const payload = await apiRequest("/api/ai/diagram", {
+          method: "POST",
+          body: JSON.stringify({ prompt: aiPrompt }),
+          signal: controller.signal,
+        });
+        const insertedElements = await convertAndInsertMermaid({
+          mermaid: payload.mermaid,
+          excalidrawAPI,
+        });
+
+        setAiPrompt("");
+        setAiDialogOpen(false);
+        excalidrawAPI.setToast({
+          message:
+            payload.provider === "groq"
+              ? `Generated diagram inserted (${insertedElements.length} elements) using the fallback provider.`
+              : `Generated diagram inserted (${insertedElements.length} elements).`,
+          duration: 4000,
+        });
+      } catch (error) {
+        if (error.name !== "AbortError") {
+          setAiError(
+            error.status
+              ? error.message
+              : "The generated Mermaid could not be converted. Refine the prompt and try again.",
+          );
+        }
+      } finally {
+        if (aiAbortController.current === controller) {
+          aiAbortController.current = null;
+          setAiBusy(false);
+        }
+      }
+    },
+    [aiBusy, aiPrompt, apiRequest, excalidrawAPI],
+  );
+
   const resetAdminForm = useCallback(() => {
     setAdminForm(ADMIN_FORM_INITIAL_STATE);
   }, []);
@@ -447,6 +513,61 @@ function App() {
     [panelOpen],
   );
 
+  const renderMermaidExport = useCallback(
+    (exportedElements) => (
+      <div className="Card mermaid-export-card">
+        <h2>Mermaid</h2>
+        <div className="Card-details">
+          Export the complete scene as a Mermaid flowchart.
+        </div>
+        <button
+          type="button"
+          className="ToolIcon_type_button ToolIcon_size_medium Card-button ToolIcon_type_button--show ToolIcon"
+          title="Export to Mermaid"
+          aria-label="Export to Mermaid"
+          onClick={() => {
+            let downloadUrl = null;
+
+            try {
+              const { mermaid, warnings } = excalidrawToMermaid(exportedElements);
+              const blob = new Blob([mermaid], {
+                type: "text/plain;charset=utf-8",
+              });
+              const downloadLink = document.createElement("a");
+
+              downloadUrl = URL.createObjectURL(blob);
+              downloadLink.href = downloadUrl;
+              downloadLink.download = toMermaidDownloadFilename(fileName);
+              downloadLink.click();
+
+              excalidrawAPI?.setToast({
+                message:
+                  warnings.length > 0
+                    ? `Mermaid export completed with omissions: ${warnings.join(" ")}`
+                    : "Mermaid file exported.",
+                closable: warnings.length > 0,
+                duration: warnings.length > 0 ? 8000 : 3000,
+              });
+            } catch (error) {
+              excalidrawAPI?.setToast({
+                message: `Mermaid export failed: ${error instanceof Error ? error.message : "Unknown error."}`,
+                closable: true,
+                duration: 8000,
+              });
+            } finally {
+              if (downloadUrl !== null) {
+                URL.revokeObjectURL(downloadUrl);
+              }
+            }
+          }}
+        >
+          <div className="ToolIcon__label">Export to Mermaid</div>
+        </button>
+      </div>
+    ),
+    [fileName, excalidrawAPI],
+  );
+
   if (!authChecked) {
     return (
       <div className="login-shell">
@@ -531,10 +652,22 @@ function App() {
             canvasActions: {
               loadScene: false,
               saveAsImage: true,
+              export: {
+                renderCustomUI: renderMermaidExport,
+              },
             },
           }}
         >
           <MainMenu>
+            <MainMenu.Item
+              onSelect={() => {
+                setAiError("");
+                setAiDialogOpen(true);
+              }}
+            >
+              Generate with AI
+            </MainMenu.Item>
+            <MainMenu.Separator />
             {isAdmin ? (
               <>
                 <MainMenu.Item onSelect={() => setAdminPanelOpen(true)}>
@@ -643,6 +776,80 @@ function App() {
 
             <p className={`status status-${status.kind}`}>{status.message}</p>
           </section>
+        ) : null}
+
+        {aiDialogOpen ? (
+          <div
+            className="ai-dialog-overlay"
+            role="presentation"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget && !aiBusy) {
+                closeAiDialog();
+              }
+            }}
+          >
+            <form
+              className="ai-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="ai-dialog-title"
+              onSubmit={generateDiagram}
+            >
+              <div className="ai-dialog-header">
+                <div>
+                  <h1 id="ai-dialog-title">Generate with AI</h1>
+                  <p>Describe the flowchart to add beside your current work.</p>
+                </div>
+                <button
+                  type="button"
+                  className="panel-toggle"
+                  onClick={closeAiDialog}
+                  aria-label={aiBusy ? "Cancel generation" : "Close AI generator"}
+                  title={aiBusy ? "Cancel generation" : "Close AI generator"}
+                >
+                  ×
+                </button>
+              </div>
+
+              <label className="ai-prompt-field">
+                <span>Diagram description</span>
+                <textarea
+                  value={aiPrompt}
+                  onChange={(event) => setAiPrompt(event.target.value)}
+                  maxLength={4000}
+                  rows={7}
+                  placeholder="For example: a support request moves through triage, approval, implementation, and closure."
+                  autoFocus
+                  disabled={aiBusy}
+                  required
+                />
+              </label>
+
+              <div className="ai-dialog-meta">
+                <span>{aiPrompt.length}/4000</span>
+                <span>No API key is sent to the browser.</span>
+              </div>
+
+              {aiError ? (
+                <p className="login-error" role="alert">
+                  {aiError}
+                </p>
+              ) : null}
+
+              <div className="ai-dialog-actions">
+                <button type="submit" disabled={aiBusy || !aiPrompt.trim()}>
+                  {aiBusy ? "Generating..." : "Generate diagram"}
+                </button>
+                <button
+                  type="button"
+                  className="admin-secondary-button"
+                  onClick={closeAiDialog}
+                >
+                  {aiBusy ? "Cancel" : "Close"}
+                </button>
+              </div>
+            </form>
+          </div>
         ) : null}
 
         {adminPanelOpen && isAdmin ? (

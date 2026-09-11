@@ -12,6 +12,7 @@ This self-hosted deployment combines Excalidraw with:
 - per-user diagram storage in PostgreSQL;
 - JSON backup copies under the runtime `data/` directory;
 - administrator-only user management for the account named `admin`; and
+- authenticated prompt-to-diagram generation through OpenRouter with Groq fallback; and
 - a Docker image and Docker Compose configuration.
 
 ## Project structure
@@ -28,19 +29,20 @@ This self-hosted deployment combines Excalidraw with:
 ### Prerequisites
 
 - Docker with Docker Compose
-- A PostgreSQL instance reachable from the container
 
-Review `docker-compose.yml` before starting. Its checked-in values target PostgreSQL through `host.docker.internal` on port `5433` and include development-only defaults for `PGPASSWORD` and `SESSION_SECRET`. Replace those secrets before any production deployment.
+The Compose stack starts two services: the Excalidraw application and an internal PostgreSQL 16 database with persistent storage. Its checked-in `PGPASSWORD` and `SESSION_SECRET` values are development-only defaults; replace them with secret-managed values before any production deployment.
 
-From the repository root, run:
+Set one or both provider keys in the current shell, then start the stack from the repository root. Compose passes them to the application container at runtime; they are not stored in the repository or image:
 
 ```powershell
+$env:OPENROUTER_API_KEY = "your-openrouter-api-key"
+$env:GROQ_API_KEY = "your-groq-api-key"
 docker compose up -d --build
 ```
 
 The application is then available at <http://localhost:3030>.
 
-The server creates the configured PostgreSQL schema and required tables on startup. The equivalent bootstrap SQL is available in `db/001_init.sql`.
+PostgreSQL is not published to the host. Compose waits for the database health check before starting the application, and the server then creates the configured schema and required tables. The equivalent bootstrap SQL is available in `db/001_init.sql`.
 
 ## Local build and development
 
@@ -64,6 +66,9 @@ $env:PGUSER = "postgres"
 $env:PGPASSWORD = "replace-me"
 $env:PGSCHEMA = "excalidraw"
 $env:SESSION_SECRET = "replace-with-a-long-random-secret"
+$env:OPENROUTER_API_KEY = "your-openrouter-api-key"
+$env:GROQ_API_KEY = "your-groq-api-key"
+$env:GROQ_MODEL = "openai/gpt-oss-20b"
 npm start
 ```
 
@@ -85,6 +90,10 @@ The server reads these environment variables:
 | `PGSCHEMA` | `excalidraw` | PostgreSQL schema |
 | `PGSSL` | `false` | Enable PostgreSQL TLS when set to `true` |
 | `SESSION_SECRET` | `change-me-in-production` | Session-signing secret; replace this default |
+| `OPENROUTER_API_KEY` | none | Server-only OpenRouter credential required for AI generation |
+| `GROQ_API_KEY` | none | Server-only Groq credential used when OpenRouter is unavailable |
+| `GROQ_MODEL` | `openai/gpt-oss-20b` | Validated server-side Groq model override |
+| `GROQ_MODELS` | none | Optional comma-separated Groq fallback chain; overrides `GROQ_MODEL` when non-empty |
 
 Docker Compose overrides some server defaults; treat `docker-compose.yml` as the source of truth for the container deployment.
 
@@ -96,6 +105,29 @@ Docker Compose overrides some server defaults; treat `docker-compose.yml` as the
 - Saving a diagram upserts its scene in PostgreSQL and writes a `.excalidraw.json` backup to `data/<username>/`.
 - Deleting a user also deletes that user's diagrams through the database relationship and removes the user's backup directory.
 - The account whose username is exactly `admin` receives the user-management interface and API permissions.
+
+## Generate a diagram with AI
+
+1. Configure `OPENROUTER_API_KEY`, `GROQ_API_KEY`, or both on the server and sign in.
+2. Open the Excalidraw main menu and select **Generate with AI**.
+3. Describe a flowchart and select **Generate diagram**.
+
+The browser calls only the authenticated local endpoint. The server first requests OpenRouter's `openrouter/free` model. If OpenRouter is unconfigured or has an eligible provider, quota, rate-limit, timeout, or transient failure, the same validated request moves through this default Groq chain:
+
+1. `openai/gpt-oss-20b`
+2. `openai/gpt-oss-120b`
+3. `qwen/qwen3.6-27b`
+4. `qwen/qwen3.8-27b`
+
+`GROQ_MODEL` remains backward compatible as the preferred first model, followed by the remaining defaults. A valid, non-empty `GROQ_MODELS` defines the complete ordered chain instead. Both forms are deduplicated and capped at four validated model IDs. Invalid configuration stops before any provider request.
+
+Each Groq attempt has its own timeout and the whole Groq chain has a shared deadline, so unavailable models cannot multiply the wait indefinitely. Credential rejection stops the chain immediately; model availability, provider, rate-limit, timeout, and malformed-output failures may continue to the next model. Invalid prompts are never sent to either provider. Returned Mermaid is validated before the browser converts it to Excalidraw elements beside the existing scene.
+
+The Qwen models are preview models according to Groq documentation and may change or be removed. For production, set `GROQ_MODELS` to only the models your organization has explicitly approved and verified for its Groq account.
+
+Generation is limited to five user requests per minute in each running application instance. A Groq fallback attempt remains part of the same user request and does not consume another quota unit. Both providers may apply additional rate limits.
+
+Do not put either key in frontend variables, source files, Dockerfiles, Compose values, or committed `.env` files. For production, inject them through your deployment platform's secret manager. Closing the dialog while a request is running cancels the browser request; server and provider timeouts remain independently bounded.
 
 ## Create the first user
 
