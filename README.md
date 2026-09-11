@@ -32,12 +32,18 @@ This self-hosted deployment combines Excalidraw with:
 
 The Compose stack starts two services: the Excalidraw application and an internal PostgreSQL 16 database with persistent storage. Its checked-in `PGPASSWORD` and `SESSION_SECRET` values are development-only defaults; replace them with secret-managed values before any production deployment.
 
-Set one or both provider keys in the current shell, then start the stack from the repository root. Compose passes them to the application container at runtime; they are not stored in the repository or image:
+Create `app/.env` with one or both provider keys. This file is ignored by Git and Compose passes its values to the application container at runtime; the keys are not embedded in the repository or image:
+
+```dotenv
+OPENROUTER_API_KEY=your-openrouter-api-key
+GROQ_API_KEY=your-groq-api-key
+GROQ_MODEL=openai/gpt-oss-20b
+```
+
+From the repository root, start the stack with that environment file:
 
 ```powershell
-$env:OPENROUTER_API_KEY = "your-openrouter-api-key"
-$env:GROQ_API_KEY = "your-groq-api-key"
-docker compose up -d --build
+docker compose --env-file app/.env up -d --build
 ```
 
 The application is then available at <http://localhost:3030>.
@@ -52,6 +58,7 @@ From `app/`, install dependencies and run the available checks:
 
 ```powershell
 npm ci
+npm test
 npm run lint
 npm run build
 ```
@@ -108,7 +115,7 @@ Docker Compose overrides some server defaults; treat `docker-compose.yml` as the
 
 ## Generate a diagram with AI
 
-1. Configure `OPENROUTER_API_KEY`, `GROQ_API_KEY`, or both on the server and sign in.
+1. Configure `OPENROUTER_API_KEY`, `GROQ_API_KEY`, or both in `app/.env` and restart the application with `docker compose --env-file app/.env up -d --build`.
 2. Open the Excalidraw main menu and select **Generate with AI**.
 3. Describe a flowchart and select **Generate diagram**.
 
@@ -128,6 +135,16 @@ The Qwen models are preview models according to Groq documentation and may chang
 Generation is limited to five user requests per minute in each running application instance. A Groq fallback attempt remains part of the same user request and does not consume another quota unit. Both providers may apply additional rate limits.
 
 Do not put either key in frontend variables, source files, Dockerfiles, Compose values, or committed `.env` files. For production, inject them through your deployment platform's secret manager. Closing the dialog while a request is running cancels the browser request; server and provider timeouts remain independently bounded.
+
+## Export a diagram to Mermaid
+
+1. Save a new diagram to the server or load an existing one so its current server name is active.
+2. Open the Excalidraw main menu and select **Save to...**.
+3. In the **Mermaid** card, select **Export to Mermaid**.
+
+The browser downloads a UTF-8 `.mmd` file using the current server diagram name. For example, a diagram saved or loaded as `deployment-flow` is exported as `deployment-flow.mmd`. Unsafe filename characters and duplicate `.mmd` suffixes are removed; an unnamed or invalid name falls back to `diagram.mmd`.
+
+The exporter preserves semantic flowchart topology rather than the exact canvas layout. It converts supported rectangles, ellipses, diamonds, bound labels, and bound arrows or lines. Unsupported, unbound, deleted, or dangling elements are omitted and reported in an Excalidraw notification. Styling, freehand drawings, images, frames, groups, exact positions, and connector bends do not have reliable Mermaid equivalents and are not preserved.
 
 ## Create the first user
 
