@@ -1,96 +1,114 @@
 # Excalidraw authenticated storage
 
-Customized self-hosted Excalidraw deployment with user authentication, PostgreSQL persistence, and per-user diagram isolation.
+> [!IMPORTANT]
+> This repository is a customized fork of the original [Excalidraw project](https://github.com/excalidraw/excalidraw), created and maintained by the Excalidraw contributors. It is not the upstream Excalidraw repository. This fork embeds the `@excalidraw/excalidraw` package and adds authentication and server-side, per-user diagram storage.
 
-## What this project includes
+## Overview
 
-- Excalidraw embedded in a custom React app
-- Express backend with login, sessions, and per-user diagram storage
-- Dockerized deployment
-- PostgreSQL-backed users, sessions, and diagrams
-- Optional JSON backup copies in the runtime `data/` folder
-- Apache reverse proxy publication through `excalidraw.arkamax.es`
+This self-hosted deployment combines Excalidraw with:
+
+- a React and Vite frontend;
+- an Express backend with login and PostgreSQL-backed sessions;
+- per-user diagram storage in PostgreSQL;
+- JSON backup copies under the runtime `data/` directory;
+- administrator-only user management for the account named `admin`; and
+- a Docker image and Docker Compose configuration.
 
 ## Project structure
 
-- `docker-compose.yml`: container orchestration
+- `app/`: React frontend, Express server, and Node.js package metadata
+- `db/001_init.sql`: PostgreSQL schema bootstrap
+- `db/create-user.example.sql`: example user-provisioning statement
+- `docker-compose.yml`: container configuration
 - `Dockerfile`: production image build
-- `app/`: frontend and backend application
-- `db/`: SQL bootstrap and admin helpers
-- `data/`: runtime backup copies of diagrams
+- `data/`: generated diagram backups, mounted by Docker and ignored by Git
 
-## Run
+## Run with Docker Compose
+
+### Prerequisites
+
+- Docker with Docker Compose
+- A PostgreSQL instance reachable from the container
+
+Review `docker-compose.yml` before starting. Its checked-in values target PostgreSQL through `host.docker.internal` on port `5433` and include development-only defaults for `PGPASSWORD` and `SESSION_SECRET`. Replace those secrets before any production deployment.
+
+From the repository root, run:
 
 ```powershell
-cd C:\docker\excalidraw
 docker compose up -d --build
 ```
 
-Application URL:
+The application is then available at <http://localhost:3030>.
 
-- `http://localhost:3030`
+The server creates the configured PostgreSQL schema and required tables on startup. The equivalent bootstrap SQL is available in `db/001_init.sql`.
 
-## Features added on top of standard Excalidraw
+## Local build and development
 
-- Login required before entering the editor
-- Per-user diagram isolation
-- Save diagrams to PostgreSQL
-- Load diagrams from PostgreSQL
-- Delete diagrams from PostgreSQL
-- Compact storage panel integrated into the top bar
-- Dedicated logout action inside the storage panel
-- Display name shown in the storage panel instead of the raw username
-- Admin-only user management from the Excalidraw hamburger menu
-- JSON backup copies written to `data\<username>\`
+The application requires Node.js and a reachable PostgreSQL instance. The production container uses Node.js 22.
 
-## PostgreSQL configuration
-
-Current deployment values:
-
-- external host: `192.168.1.222`
-- port: `5433`
-- database: `postgres`
-- user: `postgres`
-- schema: `excalidraw`
-
-The container connects to the same PostgreSQL host through `host.docker.internal`. Replace the default password and `SESSION_SECRET` before production use.
-
-## Authentication flow
-
-- Users are created manually in PostgreSQL
-- Passwords are stored as bcrypt hashes
-- Sessions are stored in PostgreSQL through `connect-pg-simple`
-- The application uses the `excalidraw.sid` cookie for authenticated requests
-- Users support `display_name` and `last_login_at`
-
-## Admin user management
-
-- If the logged-in user is `admin`, the hamburger menu shows a user management entry
-- Admins can create, edit, deactivate, and delete users
-- The admin panel shows each user's last login timestamp and diagram count
-- The login session stores whether the authenticated user has admin privileges
-
-## Manual user provisioning
-
-Generate a password hash:
+From `app/`, install dependencies and run the available checks:
 
 ```powershell
-cd C:\docker\excalidraw\app
+npm ci
+npm run lint
+npm run build
+```
+
+To run the built frontend through the Express server, configure the environment and start the server:
+
+```powershell
+$env:PGHOST = "127.0.0.1"
+$env:PGPORT = "5432"
+$env:PGDATABASE = "postgres"
+$env:PGUSER = "postgres"
+$env:PGPASSWORD = "replace-me"
+$env:PGSCHEMA = "excalidraw"
+$env:SESSION_SECRET = "replace-with-a-long-random-secret"
+npm start
+```
+
+`npm run dev` starts the Vite frontend development server. The checked-in Vite configuration does not define a proxy for the backend API, so full authenticated operation requires routing `/api` requests to the Express server or using the build-and-start workflow above.
+
+## Configuration
+
+The server reads these environment variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PORT` | `3030` | Express HTTP port |
+| `DATA_DIR` | `../data` relative to `app/` | JSON backup directory |
+| `PGHOST` | `127.0.0.1` | PostgreSQL host |
+| `PGPORT` | `5432` | PostgreSQL port |
+| `PGDATABASE` | `postgres` | PostgreSQL database |
+| `PGUSER` | `postgres` | PostgreSQL user |
+| `PGPASSWORD` | `postgres` | PostgreSQL password; replace this default |
+| `PGSCHEMA` | `excalidraw` | PostgreSQL schema |
+| `PGSSL` | `false` | Enable PostgreSQL TLS when set to `true` |
+| `SESSION_SECRET` | `change-me-in-production` | Session-signing secret; replace this default |
+
+Docker Compose overrides some server defaults; treat `docker-compose.yml` as the source of truth for the container deployment.
+
+## Authentication and storage
+
+- Users authenticate with bcrypt password hashes stored in PostgreSQL.
+- Sessions are stored in PostgreSQL by `connect-pg-simple` and use the `excalidraw.sid` cookie.
+- Diagram queries are scoped to the authenticated user's database ID.
+- Saving a diagram upserts its scene in PostgreSQL and writes a `.excalidraw.json` backup to `data/<username>/`.
+- Deleting a user also deletes that user's diagrams through the database relationship and removes the user's backup directory.
+- The account whose username is exactly `admin` receives the user-management interface and API permissions.
+
+## Create the first user
+
+After running `npm ci` in `app/`, generate a bcrypt hash:
+
+```powershell
 npm run hash-password -- your-password
 ```
 
-Then insert the user manually with the generated hash using `db\create-user.example.sql` as a template.
+Copy `db/create-user.example.sql`, replace its example username, hash, and display name, then execute the resulting statement against the configured PostgreSQL database. To enable administration, create a user whose username is exactly `admin`.
 
-## Reverse proxy
+## Upstream attribution and license
 
-Apache/XAMPP publishes the service at:
+This fork is distributed under the **MIT License**. It is based on and embeds [Excalidraw](https://github.com/excalidraw/excalidraw), whose original source code and `@excalidraw/excalidraw` package are also licensed under the MIT License; see the [upstream Excalidraw license](https://github.com/excalidraw/excalidraw/blob/master/LICENSE).
 
-- `https://excalidraw.arkamax.es`
-
-The vhost proxies traffic to the local container on `http://127.0.0.1:3030`.
-
-## Notes
-
-- Diagrams are stored in PostgreSQL and also written as `.excalidraw.json` backup copies under `data/<username>/`.
-- The `data/` runtime folder is ignored from git.
-- For internet publishing, Apache proxies `excalidraw.arkamax.es` to the local container.
+Third-party dependencies remain subject to their respective licenses. A root `LICENSE` file should accompany this repository so the MIT terms for its custom code are available with the source.
