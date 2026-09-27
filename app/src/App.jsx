@@ -50,7 +50,7 @@ function App() {
   const [fileName, setFileName] = useState(DEFAULT_FILE_NAME);
   const [availableFiles, setAvailableFiles] = useState([]);
   const [busy, setBusy] = useState(false);
-  const [panelOpen, setPanelOpen] = useState(true);
+  const [panelOpen, setPanelOpen] = useState(false);
   const [status, setStatus] = useState(createStatus());
   const [adminPanelOpen, setAdminPanelOpen] = useState(false);
   const [adminUsers, setAdminUsers] = useState([]);
@@ -74,7 +74,7 @@ function App() {
     setAuthUser(null);
     setAvailableFiles([]);
     setFileName(DEFAULT_FILE_NAME);
-    setPanelOpen(true);
+    setPanelOpen(false);
     setAdminPanelOpen(false);
     setAdminUsers([]);
     setAdminForm(ADMIN_FORM_INITIAL_STATE);
@@ -218,7 +218,7 @@ function App() {
       setAuthUser(null);
       setAvailableFiles([]);
       setFileName(DEFAULT_FILE_NAME);
-      setPanelOpen(true);
+      setPanelOpen(false);
       setAdminPanelOpen(false);
       setAdminUsers([]);
       setAdminForm(ADMIN_FORM_INITIAL_STATE);
