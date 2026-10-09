@@ -1,16 +1,51 @@
-# React + Vite
+# Application (frontend and server)
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+The React frontend and the Express server of this self-hosted Excalidraw fork. See
+the repository root `README.md` for the deployment overview, the Compose workflow and
+the full environment-variable table.
 
-Currently, two official plugins are available:
+- `src/`: React frontend (Excalidraw embedded through `@excalidraw/excalidraw`), the
+  AI prompt dialog, and the Mermaid conversion and export helpers.
+- `server.mjs`: Express server: session login, per-user diagram storage, JSON backups
+  and the AI generation endpoint.
+- `openrouter.mjs`: OpenRouter request with the validated Groq fallback chain.
+- `dist/`: built frontend, served by the Express server.
+- `scripts/hash-password.mjs`: bcrypt hash generator for provisioning users.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Scripts
 
-## React Compiler
+| Script | Purpose |
+| --- | --- |
+| `npm ci` | Install dependencies exactly as locked |
+| `npm run dev` | Vite development server for the frontend |
+| `npm run build` | Build the frontend into `dist/` |
+| `npm run lint` | ESLint over the project |
+| `npm test` | `node --test` over the server and helper tests |
+| `npm start` | Run `server.mjs` (expects a reachable PostgreSQL instance) |
+| `npm run hash-password -- <password>` | Print a bcrypt hash for `db/create-user.example.sql` |
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+The Vite development server defines no proxy for the backend API, so authenticated
+operation requires either routing `/api` to the Express server or the build-and-start
+workflow:
 
-## Expanding the ESLint configuration
+```powershell
+npm run build
+npm start
+```
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+## HTTP API
+
+The server exposes the session cookie `excalidraw.sid`; every route below except the
+authentication routes requires an authenticated session.
+
+| Route | Purpose |
+| --- | --- |
+| `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/session` | Session lifecycle |
+| `GET/POST/PUT/DELETE /api/admin/users` | User management; requires the account named exactly `admin` |
+| `GET /api/files`, `GET/PUT/DELETE /api/files/:name` | Per-user diagram storage; `PUT` takes the raw scene object |
+| `POST /api/ai/diagram` | Prompt to Mermaid through OpenRouter with the Groq fallback chain |
+
+Diagram names are normalized server-side: NFKC, runs of characters outside
+`[\w\- ]` and whitespace runs become `-`, leading and trailing `[-_. ]` are stripped,
+the result is lowercased, truncated to 80 characters, and an empty result becomes
+`diagrama-1`.
