@@ -168,4 +168,4 @@ Copy `db/create-user.example.sql`, replace its example username, hash, and displ
 
 This fork is distributed under the **MIT License**. It is based on and embeds [Excalidraw](https://github.com/excalidraw/excalidraw), whose original source code and `@excalidraw/excalidraw` package are also licensed under the MIT License; see the [upstream Excalidraw license](https://github.com/excalidraw/excalidraw/blob/master/LICENSE).
 
-Third-party dependencies remain subject to their respective licenses. A root `LICENSE` file should accompany this repository so the MIT terms for its custom code are available with the source.
+Third-party dependencies remain subject to their respective licenses. The root `LICENSE` file carries the MIT terms for this fork's custom code together with the upstream Excalidraw notice, so the terms travel with the source.
