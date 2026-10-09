@@ -5,3 +5,8 @@ app/dist-ssr/
 app/.env
 app/.env.*
 *.log
+# Local Pi runtime state and local tooling artifacts
+.atl/
+.codegraph/
+.pi/
+.playwright-mcp/
