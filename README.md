@@ -21,8 +21,13 @@ The frontend preserves local drawings when a server replacement conflicts. Save
 under a different name to keep a copy, or explicitly load the server diagram;
 there is no automatic reload/retry. Backup-only warnings mean the PostgreSQL save
 succeeded. See [frontend save behavior](app/README.md#frontend-guarded-saves-t3c1-candidate).
-**Do not deploy this transition candidate while its serialization assurance remains
-unresolved.** Guarded-save browser checks have passed.
+**Do not deploy this transition candidate.** Guarded-save browser checks passed;
+the separate T3c2 repair preserves referenced image files and deleted elements
+without copying unrelated document caches. Its three-case UI/HTTP browser proof and
+final lint passed. See [serialization scope](app/README.md#scene-serialization-repair-t3c2-candidate).
+Independent data/private-boundary verification passed for this repair; the earlier
+partial review remains historical. Already omitted data cannot be recovered by this fix.
+T3d deletion coordination, realtime and collaboration UI remain unfinished.
 
 ## Project structure
 

@@ -1,8 +1,8 @@
 # Application (frontend and server)
 
 **UI transition candidate — do not deploy yet.** Guarded-save browser checks
-passed. Independent review remains partial because the unchanged database
-serializer omits binary files and deleted elements (see below).
+passed; T3c2 repairs the separate files/tombstones omission. Independent verification
+passed for this repair; T3c1's earlier partial verdict remains a historical record.
 
 The React frontend and the Express server of this self-hosted Excalidraw fork. See
 the repository root `README.md` for the deployment overview, the Compose workflow and
@@ -173,11 +173,37 @@ fixture/config; it is not part of `npm test`. The isolated browser scenario pass
 after shortening Chromium's temporary socket path. It covers guarded saves and
 conflict retention, not binary-file or tombstone persistence.
 
-**Known pre-existing serialization limitation.** The frontend calls
-`serializeAsJSON(..., "database")`, which omits binary files and deleted elements.
-This call is unchanged by the guarded-save transition. The server preserves fields
-actually supplied by callers; passing files and deleted elements to this serializer
-does not include them in the request. Their persistence assurance remains unresolved.
+### Scene serialization repair (T3c2 candidate)
+
+`src/scene-serialization.mjs` composes the installed public database serializer with
+retained tombstones and binary files referenced by the current scene's images,
+including deleted images. Unreferenced files from other documents' caches are not
+sent. Canonical app-state cleaning, export metadata and element cleaning still
+come from Excalidraw; serialization does not modify the canvas or history. Scenes
+without files/deletions retain the existing request shape (no added `files: {}`).
+
+`src/scene-serialization.test.mjs` covers preservation, private-cache exclusion,
+immutability and canonical compatibility. `tests/browser/scene-persistence.mjs`
+exercises public UI edits/deletion, guarded HTTP saves, server GET and reload/save-as
+with the installed library. It requires an isolated fixture/Playwright config;
+`T3C2_BASELINE` optionally compares an unaffected request with a prior captured JSON
+request, replayed with its canonical indices/versions to avoid restore-generated nonces.
+Only object-key ordering is ignored; array ordering and all values are compared.
+
+The authorized corrected browser run passed all three cases: image save/reload,
+UI deletion with tombstones/referenced files, and unaffected request compatibility.
+It seeds known already-imported SVG v2 bytes/metadata and asserts exact equality
+through save, server GET and reload/save-as, excluding other-document cache files.
+Final lint passed; production source and the tested bundle remained unchanged.
+Earlier failed artifacts remain preserved: the initial SVG fixture confused import
+normalization with persistence loss, and its JSON oracle rejected object-key ordering.
+The repaired candidate also passed independent verification of data preservation
+and private-file boundaries.
+
+This repairs future saves only: it cannot recover binary files or deleted elements
+already omitted from stored scenes. T3c2's scoped persistence assurance is verified.
+T3d deletion coordination, realtime and collaboration UI remain unfinished; this
+candidate does not authorize deployment.
 
 ### Guarded stable-ID replacement (T3b)
 

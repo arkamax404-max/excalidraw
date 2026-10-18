@@ -10,6 +10,7 @@ import { excalidrawToMermaid } from "./mermaid/excalidrawToMermaid.js";
 import { toMermaidDownloadFilename } from "./mermaid/mermaidFilename.js";
 import { convertAndInsertMermaid } from "./ai/mermaidToScene.js";
 
+import { serializeScene } from "./scene-serialization.mjs";
 import { documentContext, renameDocument, beginDocumentOperation, documentHeaders,
   acknowledgeDocument, readApiResponse, documentError, normalizeDocumentName } from "./document-version.mjs";
 
@@ -240,11 +241,11 @@ function App() {
     documentVersion.current = operation;
 
     try {
-      const scene = serializeAsJSON(
+      const scene = serializeScene(
         excalidrawAPI.getSceneElementsIncludingDeleted(),
         excalidrawAPI.getAppState(),
         excalidrawAPI.getFiles(),
-        "database",
+        serializeAsJSON,
       );
 
       const result = await apiRequest(
