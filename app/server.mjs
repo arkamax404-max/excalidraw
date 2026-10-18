@@ -6,6 +6,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
+import { attachRealtime } from "./realtime.mjs";
 import {
   OpenRouterError,
   createGenerationRateLimiter,
@@ -223,8 +224,7 @@ await bootstrapDatabase();
 
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "25mb" }));
-app.use(
-  session({
+const sessionMiddleware = session({
     name: "excalidraw.sid",
     secret: SESSION_SECRET,
     resave: false,
@@ -243,8 +243,8 @@ app.use(
       createTableIfMissing: true,
       ttl: SESSION_TTL_SECONDS,
     }),
-  }),
-);
+  });
+app.use(sessionMiddleware);
 
 app.get("/api/auth/session", (request, response) => {
   if (!request.session?.user) {
@@ -979,8 +979,10 @@ app.use((error, _request, response, _next) => {
   });
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Excalidraw auth server listening on port ${PORT}`);
   console.log(`PostgreSQL schema: ${DB_SCHEMA}`);
   console.log(`Data directory: ${DATA_DIR}`);
 });
+attachRealtime(server, { sessionMiddleware, pool, schema: DB_SCHEMA,
+  trustProxy: app.get("trust proxy fn") });

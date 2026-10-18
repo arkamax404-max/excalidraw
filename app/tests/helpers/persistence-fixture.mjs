@@ -143,5 +143,5 @@ export const persistenceFixture = async (t, { seedData } = {}) => {
     accounts[alias] = login.body.user;
   };
   return { request, snapshot, setup, directory, users, storageBarrier, blocked, documentLock,
-    directoryLock, loginAs, backups, logs: () => output };
+    directoryLock, loginAs, backups, cookieFor: (user) => cookies[user], logs: () => output };
 };

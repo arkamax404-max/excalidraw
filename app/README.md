@@ -80,6 +80,29 @@ Diagram names are normalized server-side: NFKC, runs of characters outside
 the result is lowercased, truncated to 80 characters, and an empty result becomes
 `diagrama-1`.
 
+### Realtime upgrade (T4a)
+
+Connect to `ws(s)://<same-host>/api/realtime/diagrams/:id` with the existing signed
+`excalidraw.sid` login cookie and an explicit same-origin HTTP(S) `Origin` header.
+Use canonical positive BIGINT ID strings. The actor and diagram owner must currently
+be active; only the owner or a registered member can upgrade, with no admin bypass.
+The existing one-hop trusted proxy protocol is respected for TLS termination; preserve
+`Host` when proxying. `X-Forwarded-Host` does not authorize a different origin.
+
+A successful HTTP 101 sends only the UTF-8 JSON frame
+`{"type":"ready","diagramId":"<exact-id>"}`. Upgrade denials close with an empty
+body: 401 for missing/invalid sessions or inactive actors, 400 for invalid IDs,
+404 for missing/inaccessible rooms or inactive owners, and 403 for missing, opaque
+or mismatched Origin. Internal failures return an empty 500; malformed WebSocket
+handshakes return an empty 400. Origin is checked before session and room access.
+
+Compression is disabled and incoming payloads are capped at 1 KiB. Data frames close
+the connection: there is no relay, scene/file/revision payload, persistence write,
+ETag advancement or WebSocket-driven session renewal. HTTP remains the sole guarded
+scene-write authority. Continuous invalidation, relay and editor convergence await
+T4b–d/T5–T6; this slice is **not deployment approval**. The isolated API suite covers
+real-cookie upgrades/rejections and unchanged document, account-counter and backup state.
+
 ### Stable-ID reads
 
 `GET /api/diagrams` returns `{ diagrams: [...] }`, containing only the caller's

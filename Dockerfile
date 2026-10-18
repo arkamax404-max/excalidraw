@@ -18,6 +18,7 @@ ENV DATA_DIR=/data
 
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/server.mjs ./server.mjs
+COPY --from=build /app/realtime.mjs ./realtime.mjs
 COPY --from=build /app/openrouter.mjs ./openrouter.mjs
 COPY --from=build /app/package*.json ./
 COPY --from=build /app/node_modules ./node_modules
