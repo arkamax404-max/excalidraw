@@ -143,6 +143,20 @@ const bootstrapDatabase = async () => {
       )
     `);
     await client.query(`
+      ALTER TABLE ${DB_SCHEMA}.diagrams
+      ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1
+    `);
+    await client.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint
+          WHERE conrelid = '${DB_SCHEMA}.diagrams'::regclass
+          AND conname = 'diagrams_revision_positive') THEN
+          ALTER TABLE ${DB_SCHEMA}.diagrams ADD CONSTRAINT diagrams_revision_positive
+            CHECK (revision > 0);
+        END IF;
+      END $$
+    `);
+    await client.query(`
       CREATE TABLE IF NOT EXISTS ${DB_SCHEMA}.diagram_members (
         diagram_id BIGINT NOT NULL REFERENCES ${DB_SCHEMA}.diagrams(id) ON DELETE CASCADE,
         user_id BIGINT NOT NULL REFERENCES ${DB_SCHEMA}.users(id) ON DELETE CASCADE,
@@ -542,8 +556,11 @@ app.post("/api/ai/diagram", requireAuth, async (request, response) => {
 // IDs remain decimal strings: PostgreSQL BIGINT can exceed Number.MAX_SAFE_INTEGER.
 const getDiagramPayload = (row) => ({
   id: row.id,
+  revision: row.revision,
   ...getDiagramFilePayload(row.name, row.updated_at.toISOString()),
 });
+
+const diagramETag = (row) => `"${row.id}:${row.revision}"`;
 
 const isValidDiagramId = (id) =>
   /^[1-9][0-9]{0,18}$/.test(id) && BigInt(id) <= 9223372036854775807n;
@@ -556,7 +573,7 @@ const memberAccess = `EXISTS (
 app.get("/api/diagrams", requireAuth, async (request, response, next) => {
   try {
     const result = await pool.query(
-      `SELECT id, name, updated_at
+      `SELECT id, name, revision, updated_at
        FROM ${DB_SCHEMA}.diagrams
        WHERE user_id = $1 OR ${memberAccess}
        ORDER BY updated_at DESC, id DESC`,
@@ -577,7 +594,7 @@ app.get("/api/diagrams/:id", requireAuth, async (request, response, next) => {
 
   try {
     const result = await pool.query(
-      `SELECT id, name, scene_json, updated_at
+      `SELECT id, name, revision, scene_json, updated_at
        FROM ${DB_SCHEMA}.diagrams
        WHERE id = $2 AND (user_id = $1 OR ${memberAccess})`,
       [request.session.user.id, id],
@@ -587,6 +604,7 @@ app.get("/api/diagrams/:id", requireAuth, async (request, response, next) => {
       response.status(404).json({ error: "El diagrama solicitado no existe." });
       return;
     }
+    response.set("ETag", diagramETag(diagram));
     response.json({ diagram: getDiagramPayload(diagram), scene: diagram.scene_json });
   } catch (error) {
     next(error);
@@ -697,7 +715,7 @@ app.get("/api/files/:name", requireAuth, async (request, response, next) => {
     const name = sanitizeBaseName(request.params.name);
     const result = await pool.query(
       `
-        SELECT name, scene_json, updated_at
+        SELECT id, name, revision, scene_json, updated_at
         FROM ${DB_SCHEMA}.diagrams
         WHERE user_id = $1 AND name = $2
       `,
@@ -711,6 +729,7 @@ app.get("/api/files/:name", requireAuth, async (request, response, next) => {
       return;
     }
 
+    response.set("ETag", diagramETag(diagram));
     response.json({
       file: getDiagramFilePayload(diagram.name, diagram.updated_at.toISOString()),
       scene: diagram.scene_json,
@@ -735,14 +754,22 @@ app.put("/api/files/:name", requireAuth, async (request, response, next) => {
         INSERT INTO ${DB_SCHEMA}.diagrams (user_id, name, scene_json)
         VALUES ($1, $2, $3::jsonb)
         ON CONFLICT (user_id, name)
-        DO UPDATE SET scene_json = EXCLUDED.scene_json, updated_at = NOW()
-        RETURNING name, updated_at
+        DO UPDATE SET scene_json = EXCLUDED.scene_json, updated_at = NOW(),
+          revision = diagrams.revision + 1
+        WHERE diagrams.revision < 9223372036854775807
+        RETURNING id, name, revision, updated_at
       `,
       [request.session.user.id, name, JSON.stringify(scene)],
     );
 
+    if (result.rowCount === 0) {
+      response.status(409).json({ error: "El diagrama ha alcanzado el limite de revisiones." });
+      return;
+    }
+
     await writeDiagramBackup(request.session.user.username, name, scene);
 
+    response.set("ETag", diagramETag(result.rows[0]));
     response.json({
       ok: true,
       file: getDiagramFilePayload(

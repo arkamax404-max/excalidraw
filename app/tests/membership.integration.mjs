@@ -113,7 +113,7 @@ test("owner-controlled membership HTTP contracts", { timeout: 60_000 }, async (t
     expect(await request("/api/diagrams", cookies.member), 200,
       { diagrams: [...memberList.diagrams, ...ownerList.diagrams] });
     expect(await request("/api/files", cookies.member), 200,
-      { files: memberList.diagrams.map(({ id: _id, ...file }) => file) });
+      { files: memberList.diagrams.map(({ id: _id, revision: _revision, ...file }) => file) });
   });
   await t.test("nonmembers cannot discover or load and admin has no ownership bypass", async () => {
     for (const name of ["stranger", "admin"]) {

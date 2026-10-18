@@ -72,10 +72,10 @@ the result is lowercased, truncated to 80 characters, and an empty result become
 
 `GET /api/diagrams` returns `{ diagrams: [...] }`, containing only the caller's
 owned and actively joined diagrams, ordered by `updatedAt` descending, then ID descending. Each item is
-`{ id, name, fileName, updatedAt }`; `id` is a decimal **string**, preserving the
+`{ id, revision, name, fileName, updatedAt }`; `id` and `revision` are canonical decimal **strings**, preserving the
 full PostgreSQL BIGINT range. An empty account receives `{ diagrams: [] }`.
 
-`GET /api/diagrams/:id` returns `{ diagram: { id, name, fileName, updatedAt }, scene }`.
+`GET /api/diagrams/:id` returns `{ diagram: { id, revision, name, fileName, updatedAt }, scene }`.
 The scene is unchanged from the legacy load response. IDs must be canonical decimal
 integers from `1` through `9223372036854775807`; leading zeros, signs, whitespace,
 fractions and exponents are invalid. Invalid IDs return HTTP 400 with
@@ -87,6 +87,38 @@ even for malformed IDs. Being `admin` does not bypass ownership checks.
 These routes are read-only. Existing `/api/files` contracts and normalization are
 unchanged: overwrite retains the ID, while delete followed by recreation assigns
 a new ID. Membership never changes ownership; there is no ID-oriented save endpoint yet.
+
+### Revision foundation (T3a)
+
+Each diagram has a positive PostgreSQL BIGINT revision, initially `1`. Existing
+successful legacy replacements retain the ID and increment the revision exactly
+once in SQL, even when the scene is identical. Neither IDs nor revisions pass
+through JavaScript `Number`. Delete/recreate assigns a new ID with revision `1`.
+
+Successful individual `GET /api/diagrams/:id`, `GET /api/files/:name`, and
+`PUT /api/files/:name` responses carry the strong `ETag: "<id>:<revision>"` header,
+for example `"9007199254740993:2"`. Owners and active members see the same token
+on ID loads. List responses do not carry a document identity token. Legacy
+successful JSON bodies, list shape and raw scene request format remain unchanged.
+
+At revision `9223372036854775807`, a valid legacy replacement returns HTTP **409**
+`{ error: "El diagrama ha alcanzado el limite de revisiones." }` without changing
+the scene, revision, timestamp or backup. Invalid scenes still return the existing
+400 error and change nothing. Other error contracts and access rules are unchanged.
+
+Startup adds `revision BIGINT NOT NULL DEFAULT 1` and the named positive check
+constraint to fresh or existing databases. Old rows receive revision `1` without
+rewriting IDs, scenes or timestamps. SQL-managed deployments can reapply
+`db/001_init.sql` or apply `db/003_diagram_revisions.sql` after their existing 001
+(and 002 membership migration); both revision paths are idempotent. Substitute your
+schema for `excalidraw` in standalone SQL. Backups remain raw scenes, not metadata.
+
+**Foundation only:** replacements are still unguarded; `If-Match` is not enforced
+until T3c. Shared stable-ID saves/CAS (T3b), frontend token handling (T3c), and
+ordered deletion/failure closure (T3d) remain pending. This slice does not prevent
+lost updates or coordinate concurrent backups. Backup failures still use the old
+error behavior; canonical-success/backup-warning handling is not implemented yet.
+T3 as a whole is incomplete; no cross-resource atomicity or durability is promised.
 
 ### Owner-controlled memberships
 

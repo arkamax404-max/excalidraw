@@ -94,7 +94,8 @@ test("stable-ID discovery and owner-only loading", { timeout: 60_000 }, async (t
   assert.equal(bobSaved.status, 200);
   let aliceFile = aliceSaved.body.file;
   const bobFile = bobSaved.body.file;
-  const document = (id, file) => ({ id, ...file });
+  let aliceRevision = "2";
+  const document = (id, file, revision = id === aliceId ? aliceRevision : "2") => ({ id, revision, ...file });
   const backupPath = (username) => path.join(directory, username, "same-name.excalidraw.json");
   const aliceBackup = await readFile(backupPath("alice"), "utf8");
   const bobBackup = await readFile(backupPath("bob"), "utf8");
@@ -148,6 +149,7 @@ test("stable-ID discovery and owner-only loading", { timeout: 60_000 }, async (t
     const saved = await save(alice, updatedScene);
     assert.equal(saved.status, 200);
     aliceFile = saved.body.file;
+    aliceRevision = "3";
     assert.deepEqual(Object.keys(saved.body).sort(), ["file", "ok"]);
     assert.equal(saved.body.ok, true);
     assert.deepEqual(Object.keys(aliceFile).sort(), ["fileName", "name", "updatedAt"]);
@@ -174,7 +176,7 @@ test("stable-ID discovery and owner-only loading", { timeout: 60_000 }, async (t
     assert.equal(listed.body.diagrams.length, 2);
     const newerId = listed.body.diagrams[0].id;
     assert.match(newerId, /^[1-9][0-9]*$/);
-    expectResponse(listed, 200, { diagrams: [document(newerId, saved.body.file), document(aliceId, aliceFile)] });
+    expectResponse(listed, 200, { diagrams: [document(newerId, saved.body.file, "1"), document(aliceId, aliceFile)] });
     expectResponse(await request("/api/diagrams", { cookie: bob }), 200,
       { diagrams: [document(bobId, bobFile)] });
     expectResponse(await request("/api/diagrams", { cookie: admin }), 200, { diagrams: [] });
@@ -198,9 +200,9 @@ test("stable-ID discovery and owner-only loading", { timeout: 60_000 }, async (t
     const id = listed.body.diagrams[0].id;
     assert.match(id, /^[1-9][0-9]*$/);
     assert.notEqual(id, aliceId);
-    expectResponse(listed, 200, { diagrams: [document(id, saved.body.file)] });
+    expectResponse(listed, 200, { diagrams: [document(id, saved.body.file, "1")] });
     expectResponse(await request(`/api/diagrams/${id}`, { cookie: alice }), 200,
-      { diagram: document(id, saved.body.file), scene });
+      { diagram: document(id, saved.body.file, "1"), scene });
     expectResponse(await request(`/api/diagrams/${bobId}`, { cookie: bob }), 200,
       { diagram: document(bobId, bobFile), scene });
     assert.equal(await readFile(backupPath("bob"), "utf8"), bobBackup);

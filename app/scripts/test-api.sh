@@ -41,8 +41,9 @@ fi
 docker run --name "$runner" --network "$network" \
   --user "$(id -u):$(id -g)" \
   --mount "type=bind,source=$PWD,target=/workspace,readonly" \
+  --mount "type=bind,source=$PWD/../db,target=/db,readonly" \
   --workdir /workspace \
   -e API_TEST_ISOLATED=1 -e PGHOST="$database" \
   -e PGPORT=5432 -e PGUSER=postgres -e PGDATABASE=postgres \
   -e PGPASSWORD=isolated-api-test \
-  node:22-alpine node --test --test-concurrency=1 tests/api.integration.mjs tests/permissions.integration.mjs tests/membership.integration.mjs
+  node:22-alpine node --test --test-concurrency=1 tests/api.integration.mjs tests/permissions.integration.mjs tests/membership.integration.mjs tests/revisions.integration.mjs
