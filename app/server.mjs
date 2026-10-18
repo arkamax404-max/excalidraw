@@ -611,7 +611,10 @@ app.get("/api/diagrams/:id", requireAuth, async (request, response, next) => {
   }
 });
 
-// Both write routes hold the same owner/name session lock through commit AND backup.
+const diagramLockKey = (ownerId, name) =>
+  JSON.stringify([DB_SCHEMA, ownerId, sanitizeBaseName(name)]);
+
+// Saves and diagram deletion hold the same session lock through filesystem completion.
 const replaceDiagram = async ({ id, name }, userId, match, scene) => {
   const client = await pool.connect();
   let lockKey;
@@ -631,7 +634,7 @@ const replaceDiagram = async ({ id, name }, userId, match, scene) => {
       : (await client.query(`SELECT id AS user_id, username, $2::text AS name
           FROM ${DB_SCHEMA}.users WHERE id = $1 AND is_active`, target)).rows[0];
     if (!initial) return reject(404, "El diagrama solicitado no existe.");
-    const key = JSON.stringify([DB_SCHEMA, initial.user_id, sanitizeBaseName(initial.name)]);
+    const key = diagramLockKey(initial.user_id, initial.name);
     await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [key]);
     lockKey = key;
     await client.query("BEGIN");
@@ -861,13 +864,23 @@ app.put("/api/files/:name", requireAuth, async (request, response, next) => {
 });
 
 app.delete("/api/files/:name", requireAuth, async (request, response, next) => {
+  let client;
+  let lockKey;
+  let destroy = false;
   try {
     const name = sanitizeBaseName(request.params.name);
-    const result = await pool.query(
+    client = await pool.connect();
+    const key = diagramLockKey(request.session.user.id, name);
+    await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [key]);
+    lockKey = key;
+    // Resolve the stored owner under coordination, not from a stale session username.
+    // This statement commits before cleanup, preserving the existing DELETE contract.
+    const result = await client.query(
       `
-        DELETE FROM ${DB_SCHEMA}.diagrams
-        WHERE user_id = $1 AND name = $2
-        RETURNING name
+        DELETE FROM ${DB_SCHEMA}.diagrams AS diagrams
+        USING ${DB_SCHEMA}.users AS owner
+        WHERE diagrams.user_id = $1 AND diagrams.name = $2 AND owner.id = diagrams.user_id
+        RETURNING diagrams.name, owner.username
       `,
       [request.session.user.id, name],
     );
@@ -877,7 +890,7 @@ app.delete("/api/files/:name", requireAuth, async (request, response, next) => {
       return;
     }
 
-    await deleteDiagramBackup(request.session.user.username, name);
+    await deleteDiagramBackup(result.rows[0].username, name);
 
     response.json({
       ok: true,
@@ -887,7 +900,14 @@ app.delete("/api/files/:name", requireAuth, async (request, response, next) => {
       },
     });
   } catch (error) {
+    destroy = true; // Never return a failed/uncertain locked session to the pool.
     next(error);
+  } finally {
+    if (lockKey && !destroy) {
+      try { await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [lockKey]); }
+      catch (error) { destroy = true; console.error("Diagram deletion unlock failed.", error); }
+    }
+    client?.release(destroy);
   }
 });
 

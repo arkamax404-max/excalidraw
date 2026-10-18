@@ -25,11 +25,12 @@ export const persistenceFixture = async (t) => {
     // The isolated runner's container owns and discards this temporary directory.
   });
   let output = "";
-  server = spawn(process.execPath, [fileURLToPath(new URL("../../server.mjs", import.meta.url))], {
+  server = spawn(process.execPath, ["--import", fileURLToPath(new URL("./storage-barrier.mjs", import.meta.url)),
+    fileURLToPath(new URL("../../server.mjs", import.meta.url))], {
     env: { ...process.env, PORT: "3035", PGSCHEMA: schema, DATA_DIR: directory,
-      PGSSL: "false", SESSION_SECRET: "isolated-persistence-secret",
+      PGSSL: "false", PGAPPNAME: schema, SESSION_SECRET: "isolated-persistence-secret",
       OPENROUTER_API_KEY: "", GROQ_API_KEY: "" },
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
   closed = once(server, "close");
   server.stdout.on("data", (chunk) => { output += chunk; });
@@ -41,6 +42,7 @@ export const persistenceFixture = async (t) => {
   assert.match(output, /Excalidraw auth server listening/);
 
   const cookies = {};
+  const users = {};
   const request = async (route, user, method = "GET", body, headers = {}) => {
     const response = await fetch(`http://127.0.0.1:3035${route}`, {
       method,
@@ -52,7 +54,8 @@ export const persistenceFixture = async (t) => {
   };
   const hash = await bcrypt.hash("fixture-password", 4);
   for (const username of ["owner", "member", "stranger", "admin"]) {
-    await pool.query(`INSERT INTO ${schema}.users (username, password_hash) VALUES ($1, $2)`, [username, hash]);
+    users[username] = (await pool.query(`INSERT INTO ${schema}.users (username, password_hash)
+      VALUES ($1, $2) RETURNING id`, [username, hash])).rows[0].id;
     const login = await request("/api/auth/login", null, "POST", { username, password: "fixture-password" });
     assert.equal(login.status, 200);
     assert.ok(login.cookie);
@@ -81,5 +84,43 @@ export const persistenceFixture = async (t) => {
     return state;
   };
   const setup = (sql, values) => pool.query(sql.replaceAll("fixture_schema", schema), values);
-  return { request, snapshot, setup, directory, logs: () => output };
+  const storageBarrier = async (operation, relative, fault = false) => {
+    const message = async (kind) => {
+      for (;;) {
+        const [event] = await once(server, "message", { signal: AbortSignal.timeout(10_000) });
+        if (event.storage === kind) return;
+      }
+    };
+    const ready = message("armed");
+    server.send({ storage: "arm", operation, path: path.join(directory, relative), fault });
+    await ready;
+    const blocked = message("blocked");
+    // Register teardown before a failed assertion can strand the child.
+    const release = () => server.connected && server.send({ storage: "release" });
+    t.after(release);
+    return { blocked, release };
+  };
+  const blocked = async (count) => {
+    const deadline = Date.now() + 5000;
+    do {
+      const result = await pool.query(`SELECT pid, pg_blocking_pids(pid) AS blockers
+        FROM pg_stat_activity WHERE application_name = $1
+        AND cardinality(pg_blocking_pids(pid)) > 0`, [schema]);
+      if (result.rowCount === count) {
+        console.log("observed PG blocking", JSON.stringify(result.rows));
+        return result.rows;
+      }
+    } while (Date.now() < deadline);
+    assert.fail(`Expected ${count} observed blocked fixture sessions`);
+  };
+  const documentLock = async (name) => {
+    const client = await pool.connect();
+    const key = JSON.stringify([schema, users.owner, name]);
+    await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [key]);
+    return async () => {
+      await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [key]);
+      client.release();
+    };
+  };
+  return { request, snapshot, setup, directory, users, storageBarrier, blocked, documentLock, logs: () => output };
 };

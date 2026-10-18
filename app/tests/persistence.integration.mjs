@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdir } from "node:fs/promises";
+import { mkdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import { persistenceFixture } from "./helpers/persistence-fixture.mjs";
 
@@ -329,5 +329,129 @@ test("legacy saves share guarded owner/name persistence", { timeout: 60_000 }, a
     expect(await request(blocked, "owner", "PUT", scene, { "If-Match": saved.etag }), 412,
       { error: "La version del diagrama no coincide." });
     assert.deepEqual(await snapshot(id, "legacy-name"), after);
+  });
+});
+
+test("diagram deletion orders canonical changes and backup completion", { timeout: 60_000 }, async (t) => {
+  const f = await persistenceFixture(t);
+  const { request, snapshot, storageBarrier, blocked, documentLock } = f;
+  const legacy = "/api/files/ordered";
+  const missing = { error: "El diagrama solicitado no existe." };
+  const deleted = { ok: true, file: { name: "ordered", fileName: "ordered.excalidraw.json" } };
+  const other = await request(legacy, "stranger", "PUT", scene);
+  const otherBefore = await request(legacy, "stranger");
+  const assertDeleted = async (id) => {
+    expect(await request(`/api/diagrams/${id}`, "member"), 404, missing);
+    expect(await request(legacy, "owner"), 404, missing);
+    expect(await request("/api/diagrams", "owner"), 200, { diagrams: [] });
+    expect(await request("/api/diagrams", "member"), 200, { diagrams: [] });
+    assert.deepEqual((await snapshot(id, "ordered")).backups,
+      { "stranger/ordered.excalidraw.json": `${JSON.stringify(scene, null, 2)}\n` });
+    expect(await request(legacy, "stranger"), 200, otherBefore.body);
+    assert.equal((await request(legacy, "stranger")).etag, other.etag);
+  };
+  for (const mode of ["legacy", "member-ID"]) {
+    await t.test(`${mode} backup finishes before queued deletion`, async () => {
+      const created = await request(legacy, "owner", "PUT", scene);
+      const id = created.etag.slice(1).split(":")[0];
+      await request(`/api/diagrams/${id}/members`, "owner", "POST", { username: "member" });
+      const barrier = await storageBarrier("writeFile", "owner/ordered.excalidraw.json");
+      const replacement = { elements: [{ id: mode }] };
+      const saving = request(mode === "legacy" ? legacy : `/api/diagrams/${id}`,
+        mode === "legacy" ? "owner" : "member", "PUT", replacement, { "If-Match": created.etag });
+      await barrier.blocked;
+      const removing = request(legacy, "owner", "DELETE");
+      try {
+        await blocked(1);
+        const canonical = await request(`/api/diagrams/${id}`, "member");
+        assert.equal(canonical.etag, `"${id}:2"`);
+        assert.deepEqual(canonical.body.scene, replacement);
+      } finally {
+        barrier.release();
+        await Promise.all([saving, removing]);
+      }
+      assert.equal((await saving).status, 200);
+      expect(await removing, 200, deleted);
+      await assertDeleted(id);
+    });
+    await t.test(`${mode} queued old identity cannot resurrect deletion or contaminate recreation`, async () => {
+      const created = await request(legacy, "owner", "PUT", scene);
+      const id = created.etag.slice(1).split(":")[0];
+      await request(`/api/diagrams/${id}/members`, "owner", "POST", { username: "member" });
+      const barrier = await storageBarrier("unlink", "owner/ordered.excalidraw.json");
+      const unlock = await documentLock("ordered");
+      let saving;
+      const removing = request(legacy, "owner", "DELETE");
+      try {
+        try {
+          await blocked(1);
+          saving = request(mode === "legacy" ? legacy : `/api/diagrams/${id}`,
+            mode === "legacy" ? "owner" : "member", "PUT", { elements: [{ id: "stale" }] },
+            { "If-Match": created.etag });
+          await blocked(2);
+        } finally { await unlock(); }
+        await barrier.blocked;
+        await blocked(1);
+        expect(await request(legacy, "owner"), 404, missing);
+      } finally {
+        barrier.release();
+        await Promise.all([removing, saving]);
+      }
+      expect(await removing, 200, deleted);
+      expect(await saving, mode === "legacy" ? 412 : 404,
+        mode === "legacy" ? { error: "La version del diagrama no coincide." } : missing);
+      await assertDeleted(id);
+      const recreated = await request(legacy, "owner", "PUT", scene);
+      assert.notEqual(recreated.etag, created.etag);
+      const before = await snapshot(id, "ordered");
+      expect(await request(legacy, "owner", "PUT", { elements: [] }, { "If-Match": created.etag }),
+        412, { error: "La version del diagrama no coincide." });
+      assert.deepEqual(await snapshot(id, "ordered"), before);
+      expect(await request(`/api/diagrams/${id}`, "member"), 404, missing);
+      expect(await request(legacy, "owner", "DELETE"), 200, deleted);
+    });
+  }
+  await t.test("DELETE permissions, missing and ENOENT preserve existing contracts", async () => {
+    const created = await request(legacy, "owner", "PUT", scene);
+    const id = created.etag.slice(1).split(":")[0];
+    await request(`/api/diagrams/${id}/members`, "owner", "POST", { username: "member" });
+    const before = await snapshot(id, "ordered");
+    expect(await request(legacy, null, "DELETE"), 401, { error: "Necesitas iniciar sesion." });
+    for (const user of ["member", "admin"]) expect(await request(legacy, user, "DELETE"), 404, missing);
+    assert.deepEqual(await snapshot(id, "ordered"), before);
+    await unlink(path.join(f.directory, "owner/ordered.excalidraw.json"));
+    expect(await request("/api/files/Ordered!!", "owner", "DELETE", undefined, { "If-Match": "invalid" }),
+      200, deleted);
+    expect(await request(legacy, "owner", "DELETE"), 404, missing);
+    await assertDeleted(id);
+  });
+  await t.test("SQL failure rolls back; cleanup failure is 500 after deletion; both release coordination", async () => {
+    const created = await request(legacy, "owner", "PUT", scene);
+    const id = created.etag.slice(1).split(":")[0];
+    const before = await snapshot(id, "ordered");
+    await f.setup(`CREATE FUNCTION fixture_schema.reject_delete() RETURNS trigger LANGUAGE plpgsql AS
+      $$ BEGIN RAISE EXCEPTION 'isolated delete fault'; END $$;
+      CREATE TRIGGER reject_delete BEFORE DELETE ON fixture_schema.diagrams
+      FOR EACH ROW EXECUTE FUNCTION fixture_schema.reject_delete()`);
+    const internal = { error: "Se produjo un error interno en el servidor." };
+    expect(await request(legacy, "owner", "DELETE"), 500, internal);
+    assert.deepEqual(await snapshot(id, "ordered"), before);
+    await f.setup("DROP TRIGGER reject_delete ON fixture_schema.diagrams");
+    const barrier = await storageBarrier("unlink", "owner/ordered.excalidraw.json", true);
+    const removing = request(legacy, "owner", "DELETE");
+    await barrier.blocked;
+    barrier.release();
+    const failed = await removing;
+    expect(failed, 500, internal);
+    assert.equal(failed.warning, null);
+    expect(await request(legacy, "owner"), 404, missing);
+    expect(await request(`/api/diagrams/${id}`, "owner"), 404, missing);
+    expect(await request("/api/files", "owner"), 200, { files: [] });
+    assert.deepEqual((await snapshot(id, "ordered")).backups, before.backups);
+    const recovered = await request(legacy, "owner", "PUT", { elements: [] });
+    assert.equal(recovered.status, 200);
+    assert.notEqual(recovered.etag, created.etag);
+    expect(await request(legacy, "owner", "DELETE"), 200, deleted);
+    await assertDeleted(id);
   });
 });

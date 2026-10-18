@@ -149,8 +149,26 @@ later creates; IDs are not gapless.
 
 Legacy backup-only failures now use the canonical-success warning described below,
 without changing the normal success JSON shape. GET/list/membership routes remain
-unchanged. Deletion/owner-directory coordination awaits T3d.
-No cross-resource atomicity or crash durability is promised.
+unchanged. Diagram deletion coordination is described below; owner-directory
+coordination remains deferred to T3d1. No cross-resource atomicity or crash durability
+is promised.
+
+### Ordered diagram deletion (T3d0)
+
+`DELETE /api/files/:name` remains owner-only and requires no `If-Match`. It shares
+both save routes' stored-owner/normalized-name PostgreSQL session lock through
+backup cleanup: an earlier save finishes its backup before deletion, and a queued
+old-identity replacement cannot recreate the deleted identity. Member ID saves
+coordinate on the stored owner, not the acting member. Recreation gets a new ID.
+
+DELETE still commits PostgreSQL deletion **before** unlinking the backup. A missing
+backup is ignored; other cleanup failures return the existing generic HTTP 500
+`{ error: "Se produjo un error interno en el servidor." }` despite canonical deletion.
+This is not PUT's canonical-success warning contract. Failed cleanup may leave a
+stale backup; no automatic repair, archive or filesystem durability is promised.
+The isolated tests exercise backup-window barriers, observed PostgreSQL blocking,
+SQL/cleanup failures and subsequent operation. **Owner-account deletion and directory
+cleanup are not yet coordinated (T3d1); do not deploy this intermediate closure.**
 
 ### Frontend guarded saves (T3c1 candidate)
 
