@@ -8,6 +8,7 @@
     "build": "vite build",
     "lint": "eslint .",
     "test": "node --test",
+    "test:api": "bash scripts/test-api.sh",
     "start": "node server.mjs",
     "hash-password": "node scripts/hash-password.mjs"
   },

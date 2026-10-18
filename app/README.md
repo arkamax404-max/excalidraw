@@ -21,6 +21,7 @@ the full environment-variable table.
 | `npm run build` | Build the frontend into `dist/` |
 | `npm run lint` | ESLint over the project |
 | `npm test` | `node --test` over the server and helper tests |
+| `npm run test:api` | HTTP authentication/storage regression tests with disposable Docker PostgreSQL (requires Bash, Docker and `npm ci`) |
 | `npm start` | Run `server.mjs` (expects a reachable PostgreSQL instance) |
 | `npm run hash-password -- <password>` | Print a bcrypt hash for `db/create-user.example.sql` |
 
@@ -32,6 +33,21 @@ workflow:
 npm run build
 npm start
 ```
+
+## Isolated API tests
+
+After `npm ci`, run `npm run test:api` from `app/`. The runner uses
+`postgres:16-alpine` and `node:22-alpine`, creates a unique internal Docker network
+and a disposable database with temporary storage, and mounts the application
+read-only. It publishes no ports, ignores local database/provider configuration,
+and removes its containers and network on exit. Existing application containers,
+users, database volumes and backups are not touched.
+
+The tests start the real server and cover sessions, login/logout, private diagram
+save/list/load/overwrite/delete, JSON backups, user isolation and rejected saves.
+Database access is used only to provision fixtures; behavior is checked through
+HTTP and backup files. `npm test` remains the fast suite without Docker. Running
+the integration file directly is intentionally rejected: use the isolated runner.
 
 ## HTTP API
 
