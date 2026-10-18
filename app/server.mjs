@@ -611,8 +611,8 @@ app.get("/api/diagrams/:id", requireAuth, async (request, response, next) => {
   }
 });
 
-// Session lock spans SQL commit AND backup completion; only guarded saves participate.
-const replaceDiagram = async (id, userId, match, scene) => {
+// Both write routes hold the same owner/name session lock through commit AND backup.
+const replaceDiagram = async ({ id, name }, userId, match, scene) => {
   const client = await pool.connect();
   let lockKey;
   let transaction = false;
@@ -622,38 +622,57 @@ const replaceDiagram = async (id, userId, match, scene) => {
       owner.username, diagrams.updated_at
     FROM ${DB_SCHEMA}.diagrams AS diagrams
     JOIN ${DB_SCHEMA}.users AS owner ON owner.id = diagrams.user_id
-    WHERE diagrams.id = $2 AND ((diagrams.user_id = $1 AND owner.is_active) OR ${memberAccess})`;
+    WHERE ${name === undefined
+      ? `diagrams.id = $2 AND ((diagrams.user_id = $1 AND owner.is_active) OR ${memberAccess})`
+      : "diagrams.name = $2 AND diagrams.user_id = $1 AND owner.is_active"}`;
+  const target = [userId, name ?? id];
   try {
-    const initial = (await client.query(scoped, [userId, id])).rows[0];
+    const initial = name === undefined ? (await client.query(scoped, target)).rows[0]
+      : (await client.query(`SELECT id AS user_id, username, $2::text AS name
+          FROM ${DB_SCHEMA}.users WHERE id = $1 AND is_active`, target)).rows[0];
     if (!initial) return reject(404, "El diagrama solicitado no existe.");
     const key = JSON.stringify([DB_SCHEMA, initial.user_id, sanitizeBaseName(initial.name)]);
     await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [key]);
     lockKey = key;
     await client.query("BEGIN");
     transaction = true;
-    const current = (await client.query(`${scoped} FOR UPDATE OF diagrams`, [userId, id])).rows[0];
-    if (!current || current.user_id !== initial.user_id || current.name !== initial.name) {
+    const current = (await client.query(`${scoped} FOR UPDATE OF diagrams`, target)).rows[0];
+    const owner = current ?? (name === undefined ? null : (await client.query(
+      `SELECT id AS user_id, username, $2::text AS name FROM ${DB_SCHEMA}.users
+       WHERE id = $1 AND is_active`, target)).rows[0]);
+    if (!owner || owner.user_id !== initial.user_id || owner.name !== initial.name) {
       return reject(404, "El diagrama solicitado no existe.");
     }
-    if (match === undefined) return reject(428, "Debes indicar If-Match.");
-    const parts = /^"([1-9][0-9]{0,18}):([1-9][0-9]{0,18})"$/.exec(match);
-    if (!parts || !isValidDiagramId(parts[1]) || !isValidDiagramId(parts[2])) {
-      return reject(400, "If-Match no es valido.");
+    if (match !== undefined) {
+      const parts = /^"([1-9][0-9]{0,18}):([1-9][0-9]{0,18})"$/.exec(match);
+      if (!parts || !isValidDiagramId(parts[1]) || !isValidDiagramId(parts[2])) {
+        return reject(400, "If-Match no es valido.");
+      }
+      if (!current || match !== diagramETag(current)) return reject(412, "La version del diagrama no coincide.");
+    } else if (current) {
+      return reject(428, "Debes indicar If-Match.");
     }
-    if (match !== diagramETag(current)) return reject(412, "La version del diagrama no coincide.");
     if (!isValidScene(scene)) return reject(400, "El contenido del diagrama no es valido.");
-    if (current.revision === "9223372036854775807") {
+    // Legacy upserts allocated an ID even on replacement; preserve later create identities.
+    if (current && name !== undefined) {
+      await client.query("SELECT nextval(pg_get_serial_sequence($1, 'id'))", [`${DB_SCHEMA}.diagrams`]);
+    }
+    if (current?.revision === "9223372036854775807") {
       return reject(409, "El diagrama ha alcanzado el limite de revisiones.");
     }
     // Authorization linearizes at this statement's READ COMMITTED snapshot.
-    const result = await client.query(
+    const result = current ? await client.query(
       `UPDATE ${DB_SCHEMA}.diagrams AS diagrams
        SET scene_json = $3::jsonb, revision = diagrams.revision + 1, updated_at = NOW()
        FROM ${DB_SCHEMA}.users AS owner
        WHERE diagrams.id = $2 AND owner.id = diagrams.user_id AND diagrams.revision = $4
          AND ((diagrams.user_id = $1 AND owner.is_active) OR ${memberAccess})
        RETURNING diagrams.id, diagrams.name, diagrams.revision, diagrams.updated_at`,
-      [userId, id, JSON.stringify(scene), current.revision],
+      [userId, current.id, JSON.stringify(scene), current.revision],
+    ) : await client.query(
+      `INSERT INTO ${DB_SCHEMA}.diagrams (user_id, name, scene_json)
+       SELECT id, $2, $3::jsonb FROM ${DB_SCHEMA}.users WHERE id = $1 AND is_active
+       RETURNING id, name, revision, updated_at`, [userId, name, JSON.stringify(scene)],
     );
     if (!result.rowCount) return reject(404, "El diagrama solicitado no existe.");
     await client.query("COMMIT");
@@ -661,7 +680,7 @@ const replaceDiagram = async (id, userId, match, scene) => {
     const diagram = result.rows[0];
     const body = { ok: true, diagram: getDiagramPayload(diagram) };
     try {
-      await writeDiagramBackup(current.username, current.name, scene);
+      await writeDiagramBackup(owner.username, owner.name, scene);
     } catch (error) {
       console.error("Canonical diagram saved; backup failed.", error);
       body.warning = "diagram-backup-failed";
@@ -689,7 +708,7 @@ app.put("/api/diagrams/:id", requireAuth, async (request, response, next) => {
     return;
   }
   try {
-    const result = await replaceDiagram(request.params.id, request.session.user.id,
+    const result = await replaceDiagram({ id: request.params.id }, request.session.user.id,
       request.get("If-Match"), request.body);
     if (result.etag) response.set("ETag", result.etag);
     if (result.body.warning) response.set("X-Backup-Warning", result.body.warning);
@@ -827,42 +846,15 @@ app.get("/api/files/:name", requireAuth, async (request, response, next) => {
 
 app.put("/api/files/:name", requireAuth, async (request, response, next) => {
   try {
-    const name = sanitizeBaseName(request.params.name);
-    const scene = request.body;
-
-    if (!isValidScene(scene)) {
-      response.status(400).json({ error: "El contenido del diagrama no es valido." });
-      return;
+    const result = await replaceDiagram({ name: sanitizeBaseName(request.params.name) },
+      request.session.user.id, request.get("If-Match"), request.body);
+    if (result.etag) response.set("ETag", result.etag);
+    if (result.body.warning) response.set("X-Backup-Warning", result.body.warning);
+    if (result.body.diagram) {
+      const { id: _id, revision: _revision, ...file } = result.body.diagram;
+      result.body = { ok: true, file, ...(result.body.warning ? { warning: result.body.warning } : {}) };
     }
-
-    const result = await pool.query(
-      `
-        INSERT INTO ${DB_SCHEMA}.diagrams (user_id, name, scene_json)
-        VALUES ($1, $2, $3::jsonb)
-        ON CONFLICT (user_id, name)
-        DO UPDATE SET scene_json = EXCLUDED.scene_json, updated_at = NOW(),
-          revision = diagrams.revision + 1
-        WHERE diagrams.revision < 9223372036854775807
-        RETURNING id, name, revision, updated_at
-      `,
-      [request.session.user.id, name, JSON.stringify(scene)],
-    );
-
-    if (result.rowCount === 0) {
-      response.status(409).json({ error: "El diagrama ha alcanzado el limite de revisiones." });
-      return;
-    }
-
-    await writeDiagramBackup(request.session.user.username, name, scene);
-
-    response.set("ETag", diagramETag(result.rows[0]));
-    response.json({
-      ok: true,
-      file: getDiagramFilePayload(
-        result.rows[0].name,
-        result.rows[0].updated_at.toISOString(),
-      ),
-    });
+    response.status(result.status).json(result.body);
   } catch (error) {
     next(error);
   }

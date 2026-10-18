@@ -11,7 +11,7 @@ const expect = (result, status, body) => {
   assert.deepEqual(result.body, body);
 };
 
-test("persistence fixture anchors current unguarded legacy behavior", { timeout: 60_000 }, async (t) => {
+test("persistence fixture anchors guarded legacy behavior", { timeout: 60_000 }, async (t) => {
   const { request, snapshot } = await persistenceFixture(t);
   const legacy = "/api/files/shared-scene";
   const created = await request("/api/files/Shared Scene!!", "owner", "PUT", scene);
@@ -50,7 +50,7 @@ test("persistence fixture anchors current unguarded legacy behavior", { timeout:
 
   await t.test("rejected writes and private reads preserve complete public state and backup bytes", async () => {
     const before = await snapshot(id, "shared-scene");
-    expect(await request(legacy, "owner", "PUT", { elements: "invalid" }), 400,
+    expect(await request(legacy, "owner", "PUT", { elements: "invalid" }, { "If-Match": created.etag }), 400,
       { error: "El contenido del diagrama no es valido." });
     expect(await request(legacy, null, "PUT", scene), 401, { error: "Necesitas iniciar sesion." });
     for (const user of ["stranger", "admin"]) {
@@ -60,9 +60,9 @@ test("persistence fixture anchors current unguarded legacy behavior", { timeout:
     assert.deepEqual(await snapshot(id, "shared-scene"), before);
   });
 
-  await t.test("legacy replacement remains blind, retains ID and advances its exact token once", async () => {
+  await t.test("legacy replacement retains ID and advances its exact token once", async () => {
     const replacement = { ...scene, elements: [...scene.elements, { id: "new", isDeleted: false }] };
-    const saved = await request(legacy, "owner", "PUT", replacement);
+    const saved = await request(legacy, "owner", "PUT", replacement, { "If-Match": created.etag });
     assert.equal(saved.status, 200);
     assert.equal(saved.etag, `"${id}:2"`);
     expect(saved, 200, { ok: true, file: { ...file, updatedAt: saved.body.file.updatedAt } });
@@ -74,6 +74,9 @@ test("persistence fixture anchors current unguarded legacy behavior", { timeout:
     expect(await request("/api/diagrams", "owner"), 200, { diagrams: [metadata("2", saved.body.file)] });
     assert.deepEqual((await snapshot(id, "shared-scene")).backups,
       { "owner/shared-scene.excalidraw.json": `${JSON.stringify(replacement, null, 2)}\n` });
+    const next = await request("/api/files/after-replacement", "owner", "PUT", scene);
+    assert.equal(next.status, 200);
+    assert.equal(next.etag, `"${BigInt(id) + 2n}:1"`, "legacy replacement retains historical ID allocation");
   });
 });
 
@@ -217,5 +220,114 @@ test("guarded stable-ID persistence contracts", { timeout: 60_000 }, async (t) =
     assert.deepEqual(after.backups, backupsBefore);
     expect(await save("owner", old, replacement, url), 412, { error: "La version del diagrama no coincide." });
     assert.deepEqual(await snapshot(target.id, "blocked"), after);
+  });
+});
+
+test("legacy saves share guarded owner/name persistence", { timeout: 60_000 }, async (t) => {
+  const { request, snapshot, setup, directory } = await persistenceFixture(t);
+  const url = "/api/files/Legacy Name!!";
+  const first = await request(url, "owner", "PUT", scene);
+  assert.equal(first.status, 200);
+  const id = first.etag.slice(1).split(":")[0];
+  const save = (token, body = scene, user = "owner") => request(url, user, "PUT", body,
+    token === undefined ? {} : { "If-Match": token });
+  const rejected = async (token, status, error) => {
+    const before = await snapshot(id, "legacy-name");
+    const result = await save(token);
+    expect(result, status, { error });
+    assert.equal(result.warning, null);
+    assert.notEqual(result.etag, first.etag);
+    assert.deepEqual(await snapshot(id, "legacy-name"), before);
+  };
+  await t.test("existing normalized names require the caller's exact identity token", async () => {
+    await rejected(undefined, 428, "Debes indicar If-Match.");
+    for (const token of ["*", `W/${first.etag}`, `${first.etag}, ${first.etag}`, '"01:1"',
+      '"1:0"', '"1:9223372036854775808"']) {
+      await rejected(token, 400, "If-Match no es valido.");
+    }
+    await rejected(`"${id}:2"`, 412, "La version del diagrama no coincide.");
+    await rejected('"9223372036854775807:1"', 412, "La version del diagrama no coincide.");
+  });
+  await t.test("legacy and ID same-token competitors preserve the distinct winning scene and backup", async () => {
+    const variants = [{ ...scene, elements: [{ id: "legacy" }] }, { ...scene, elements: [{ id: "id" }] }];
+    const pair = await Promise.all([save(first.etag, variants[0]),
+      request(`/api/diagrams/${id}`, "owner", "PUT", variants[1], { "If-Match": first.etag })]);
+    assert.deepEqual(pair.map((r) => r.status).sort(), [200, 412]);
+    const winner = pair.findIndex((r) => r.status === 200);
+    assert.equal(pair[winner].etag, `"${id}:2"`);
+    expect(pair[1 - winner], 412, { error: "La version del diagrama no coincide." });
+    const loaded = await request(`/api/diagrams/${id}`, "owner");
+    assert.equal(loaded.etag, pair[winner].etag);
+    assert.equal(loaded.body.diagram.revision, "2");
+    assert.deepEqual(loaded.body.scene, variants[winner]);
+    assert.equal((await snapshot(id, "legacy-name")).backups["owner/legacy-name.excalidraw.json"],
+      `${JSON.stringify(variants[winner], null, 2)}\n`);
+    await rejected(first.etag, 412, "La version del diagrama no coincide.");
+  });
+  await t.test("member names stay private and normalized fresh-name competitors never upsert", async () => {
+    await request(`/api/diagrams/${id}/members`, "owner", "POST", { username: "member" });
+    expect(await save(first.etag, scene, "member"), 412, { error: "La version del diagrama no coincide." });
+    expect(await request("/api/files/legacy-name", "member"), 404, { error: "El diagrama solicitado no existe." });
+    await setup("UPDATE fixture_schema.users SET is_active = FALSE WHERE username = 'owner'");
+    await rejected(undefined, 404, "El diagrama solicitado no existe.");
+    await setup("UPDATE fixture_schema.users SET is_active = TRUE WHERE username = 'owner'");
+    const variants = [{ elements: [{ id: "one" }] }, { elements: [{ id: "two" }] }];
+    const pair = await Promise.all([request("/api/files/Fresh Name!!", "owner", "PUT", variants[0]),
+      request("/api/files/fresh-name", "owner", "PUT", variants[1])]);
+    assert.deepEqual(pair.map((r) => r.status).sort(), [200, 428]);
+    const winner = pair.findIndex((r) => r.status === 200);
+    expect(pair[1 - winner], 428, { error: "Debes indicar If-Match." });
+    assert.match(pair[winner].etag, /^"[1-9][0-9]*:1"$/);
+    const loaded = await request("/api/files/fresh-name", "owner");
+    expect(loaded, 200, { file: pair[winner].body.file, scene: variants[winner] });
+    assert.equal(loaded.etag, pair[winner].etag);
+    assert.equal((await snapshot(id, "legacy-name")).backups["owner/fresh-name.excalidraw.json"],
+      `${JSON.stringify(variants[winner], null, 2)}\n`);
+  });
+  await t.test("deleted identity cannot recreate a name or overwrite its replacement identity", async () => {
+    assert.equal((await request(url, "owner", "DELETE")).status, 200);
+    await rejected("*", 400, "If-Match no es valido.");
+    await rejected(first.etag, 412, "La version del diagrama no coincide.");
+    const recreated = await save();
+    assert.equal(recreated.status, 200);
+    assert.notEqual(recreated.etag, first.etag);
+    await rejected(first.etag, 412, "La version del diagrama no coincide.");
+  });
+  await t.test("legacy SQL rollback recovers without a backup write or stuck session", async () => {
+    const current = await request(url, "owner");
+    await setup(`CREATE FUNCTION fixture_schema.reject_legacy() RETURNS trigger LANGUAGE plpgsql AS
+      $$ BEGIN RAISE EXCEPTION 'isolated legacy fault'; END $$;
+      CREATE TRIGGER reject_legacy BEFORE UPDATE ON fixture_schema.diagrams
+      FOR EACH ROW EXECUTE FUNCTION fixture_schema.reject_legacy()`);
+    await rejected(current.etag, 500, "Se produjo un error interno en el servidor.");
+    await setup("DROP TRIGGER reject_legacy ON fixture_schema.diagrams");
+    assert.equal((await save(current.etag)).status, 200);
+  });
+  await t.test("legacy create backup failure returns canonical success and never repeats creation", async () => {
+    await mkdir(path.join(directory, "owner", "blocked-legacy.excalidraw.json"));
+    const blocked = "/api/files/blocked-legacy";
+    const saved = await request(blocked, "owner", "PUT", scene);
+    expect(saved, 200, { ok: true, file: { name: "blocked-legacy", fileName: "blocked-legacy.excalidraw.json",
+      updatedAt: saved.body.file.updatedAt }, warning: "diagram-backup-failed" });
+    assert.equal(saved.warning, "diagram-backup-failed");
+    assert.match(saved.etag, /^"[1-9][0-9]*:1"$/);
+    const loaded = await request(blocked, "owner");
+    expect(loaded, 200, { file: saved.body.file, scene });
+    assert.equal(loaded.etag, saved.etag);
+    const before = await snapshot(id, "legacy-name");
+    expect(await request(blocked, "owner", "PUT", scene), 428, { error: "Debes indicar If-Match." });
+    assert.deepEqual(await snapshot(id, "legacy-name"), before);
+    const replacement = { elements: [] };
+    const updated = await request(blocked, "owner", "PUT", replacement, { "If-Match": saved.etag });
+    assert.equal(updated.status, 200);
+    assert.equal(updated.warning, "diagram-backup-failed");
+    expect(updated, 200, { ok: true, file: { ...saved.body.file, updatedAt: updated.body.file.updatedAt },
+      warning: "diagram-backup-failed" });
+    assert.equal(updated.etag, saved.etag.replace(":1\"", ":2\""));
+    expect(await request(blocked, "owner"), 200, { file: updated.body.file, scene: replacement });
+    const after = await snapshot(id, "legacy-name");
+    expect(await request(blocked, "owner", "PUT", scene, { "If-Match": saved.etag }), 412,
+      { error: "La version del diagrama no coincide." });
+    assert.deepEqual(await snapshot(id, "legacy-name"), after);
   });
 });

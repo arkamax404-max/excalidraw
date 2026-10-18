@@ -17,15 +17,15 @@ const denied = { error: "Necesitas ser propietario del diagrama." };
 const invalidId = { error: "El identificador de diagrama no es valido." };
 const invalidUser = { error: "El usuario no es valido." };
 const ownerError = { error: "El propietario no puede ser miembro." };
-const request = async (route, cookie, method = "GET", body) => {
+const request = async (route, cookie, method = "GET", body, headers = {}) => {
   const response = await fetch(`${base}${route}`, {
-    method, headers: { "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}) },
+    method, headers: { "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}), ...headers },
     ...(body === undefined || method === "GET" ? {} : { body: JSON.stringify(body) }),
   });
   const text = await response.text();
   let payload;
   try { payload = JSON.parse(text); } catch { payload = text; }
-  return { status: response.status, body: payload, cookie: response.headers.get("set-cookie")?.split(";")[0] };
+  return { status: response.status, body: payload, etag: response.headers.get("etag"), cookie: response.headers.get("set-cookie")?.split(";")[0] };
 };
 const expect = (result, status, body) => {
   assert.equal(result.status, status);
@@ -70,9 +70,10 @@ test("owner-controlled membership HTTP contracts", { timeout: 60_000 }, async (t
   }
   await pool.query(`INSERT INTO ${schema}.diagrams (id, user_id, name, scene_json)
     VALUES ('9007199254740993', $1, 'same-name', $2::jsonb)`, [users.owner.id, JSON.stringify(scene)]);
-  for (const username of ["owner", "member"]) {
-    assert.equal((await request("/api/files/Same Name", cookies[username], "PUT", scene)).status, 200);
-  }
+  const existing = await request("/api/files/same-name", cookies.owner);
+  assert.equal((await request("/api/files/Same Name", cookies.owner, "PUT", scene,
+    { "If-Match": existing.etag })).status, 200);
+  assert.equal((await request("/api/files/Same Name", cookies.member, "PUT", scene)).status, 200);
   const ownerList = (await request("/api/diagrams", cookies.owner)).body;
   const memberList = (await request("/api/diagrams", cookies.member)).body;
   const id = ownerList.diagrams[0].id;

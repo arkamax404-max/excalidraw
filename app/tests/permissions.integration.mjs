@@ -17,17 +17,17 @@ const invalid = { error: "El identificador de diagrama no es valido." };
 const aliceId = "9007199254740993"; // BIGINT IDs must never pass through Number.
 const bobId = "200";
 
-const request = async (route, { cookie, body, ...options } = {}) => {
+const request = async (route, { cookie, body, headers = {}, ...options } = {}) => {
   const response = await fetch(`${base}${route}`, {
     ...options,
-    headers: { "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}) },
+    headers: { "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}), ...headers },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   const text = await response.text();
   let payload;
   try { payload = JSON.parse(text); } catch { payload = text; }
   return {
-    status: response.status, body: payload,
+    status: response.status, body: payload, etag: response.headers.get("etag"),
     cookie: response.headers.get("set-cookie")?.split(";")[0],
   };
 };
@@ -87,9 +87,13 @@ test("stable-ID discovery and owner-only loading", { timeout: 60_000 }, async (t
   const alice = await login("alice");
   const bob = await login("bob");
   const admin = await login("admin");
-  const save = (cookie, body = scene) => request("/api/files/Same Name", { method: "PUT", cookie, body });
-  const aliceSaved = await save(alice);
-  const bobSaved = await save(bob);
+  const save = (cookie, body = scene, token) => request("/api/files/Same Name", {
+    method: "PUT", cookie, body, headers: token ? { "If-Match": token } : {},
+  });
+  const aliceLoaded = await request(`/api/diagrams/${aliceId}`, { cookie: alice });
+  const bobLoaded = await request(`/api/diagrams/${bobId}`, { cookie: bob });
+  const aliceSaved = await save(alice, scene, aliceLoaded.etag);
+  const bobSaved = await save(bob, scene, bobLoaded.etag);
   assert.equal(aliceSaved.status, 200);
   assert.equal(bobSaved.status, 200);
   let aliceFile = aliceSaved.body.file;
@@ -146,7 +150,7 @@ test("stable-ID discovery and owner-only loading", { timeout: 60_000 }, async (t
 
   await t.test("legacy overwrite preserves ID, full scene and exact legacy response shape", async () => {
     const updatedScene = { ...scene, files: { image: { id: "image", dataURL: "data:image/png;base64,AA==" } } };
-    const saved = await save(alice, updatedScene);
+    const saved = await save(alice, updatedScene, aliceSaved.etag);
     assert.equal(saved.status, 200);
     aliceFile = saved.body.file;
     aliceRevision = "3";

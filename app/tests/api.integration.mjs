@@ -17,15 +17,16 @@ const scene = {
   appState: { viewBackgroundColor: "#ffffff" }, files: {},
 };
 
-const request = async (route, { cookie, body, ...options } = {}) => {
+const request = async (route, { cookie, body, headers = {}, ...options } = {}) => {
   const response = await fetch(`${base}${route}`, {
     ...options,
-    headers: { "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}) },
+    headers: { "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}), ...headers },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   return {
     status: response.status,
     body: await response.json(),
+    etag: response.headers.get("etag"),
     cookie: response.headers.get("set-cookie")?.split(";")[0],
   };
 };
@@ -127,7 +128,7 @@ test("authentication and private diagram storage baseline", { timeout: 60_000 },
     expectResponse(await request("/api/files/private-diagram", { cookie: alice }), 200,
       { file: saved.body.file, scene });
     const updated = { ...scene, elements: [{ id: "first", type: "rectangle", isDeleted: true }], files: { image: { id: "image", dataURL: "data:image/png;base64,AA==" } } };
-    const overwritten = await request("/api/files/private-diagram", { method: "PUT", cookie: alice, body: updated });
+    const overwritten = await request("/api/files/private-diagram", { method: "PUT", cookie: alice, body: updated, headers: { "If-Match": saved.etag } });
     assert.equal(overwritten.status, 200);
     assert.equal(overwritten.body.ok, true);
     expectResponse(await request("/api/files/private-diagram", { cookie: alice }), 200,
@@ -157,7 +158,8 @@ test("authentication and private diagram storage baseline", { timeout: 60_000 },
     const backupPath = path.join(directory, "alice/private-diagram.excalidraw.json");
     const backup = await readFile(backupPath, "utf8");
     for (const name of ["private-diagram", "new-invalid"]) {
-      expectResponse(await request(`/api/files/${name}`, { method: "PUT", cookie: alice, body: { elements: "invalid" } }),
+      expectResponse(await request(`/api/files/${name}`, { method: "PUT", cookie: alice, body: { elements: "invalid" },
+        headers: name === "private-diagram" ? { "If-Match": before.etag } : {} }),
         400, { error: "El contenido del diagrama no es valido." });
     }
     expectResponse(await request("/api/files/private-diagram", { cookie: alice }), 200, before.body);

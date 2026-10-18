@@ -17,9 +17,9 @@ const timestamp = "2020-01-02T03:04:05.000Z";
 const scene = { elements: [{ id: "deleted", isDeleted: true }],
   appState: { scrollX: 12 }, files: { image: { dataURL: "data:image/png;base64,AA==" } } };
 const missing = { error: "El diagrama solicitado no existe." };
-const request = async (route, cookie, method = "GET", body) => {
+const request = async (route, cookie, method = "GET", body, headers = {}) => {
   const response = await fetch(`${base}${route}`, {
-    method, headers: { "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}) },
+    method, headers: { "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}), ...headers },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   return { status: response.status, body: await response.json(),
@@ -144,7 +144,8 @@ test("public revision foundation and additive migrations", { timeout: 60_000 }, 
   });
   const backup = path.join(directory, "owner", "old.excalidraw.json");
   await t.test("legacy normalized overwrite increments once, retains ID, raw scene and JSON shape", async () => {
-    const saved = await request("/api/files/Old!!", cookies.owner, "PUT", scene);
+    const prior = await request(route, cookies.owner);
+    const saved = await request("/api/files/Old!!", cookies.owner, "PUT", scene, { "If-Match": prior.etag });
     assert.equal(saved.status, 200);
     assert.equal(saved.etag, `"${id}:2"`);
     assert.deepEqual(Object.keys(saved.body).sort(), ["file", "ok"]);
@@ -156,7 +157,7 @@ test("public revision foundation and additive migrations", { timeout: 60_000 }, 
     assert.deepEqual(JSON.parse(await readFile(backup, "utf8")), scene);
     const before = await request(route, cookies.owner);
     const bytes = await readFile(backup, "utf8");
-    expect(await request(legacy, cookies.owner, "PUT", { elements: "invalid" }), 400,
+    expect(await request(legacy, cookies.owner, "PUT", { elements: "invalid" }, { "If-Match": before.etag }), 400,
       { error: "El contenido del diagrama no es valido." });
     assert.deepEqual(await request(route, cookies.owner), before);
     assert.equal(await readFile(backup, "utf8"), bytes);
@@ -171,7 +172,8 @@ test("public revision foundation and additive migrations", { timeout: 60_000 }, 
     await writeFile(path.join(directory, "owner", `${name}.excalidraw.json`), `${JSON.stringify(scene)}\n`);
   }
   await t.test("revisions above safe integer stay exact through reads and SQL increments", async () => {
-    const saved = await request("/api/files/precise", cookies.owner, "PUT", scene);
+    const prior = await request("/api/files/precise", cookies.owner);
+    const saved = await request("/api/files/precise", cookies.owner, "PUT", scene, { "If-Match": prior.etag });
     assert.equal(saved.etag, '"9007199254740994:9007199254740994"');
     const loaded = await request("/api/diagrams/9007199254740994", cookies.owner);
     assert.equal(loaded.body.diagram.revision, "9007199254740994");
@@ -182,7 +184,7 @@ test("public revision foundation and additive migrations", { timeout: 60_000 }, 
     const before = await request(url, cookies.owner);
     const boundaryBackup = path.join(directory, "owner", "overflow.excalidraw.json");
     const bytes = await readFile(boundaryBackup, "utf8");
-    expect(await request("/api/files/overflow", cookies.owner, "PUT", { elements: [] }), 409,
+    expect(await request("/api/files/overflow", cookies.owner, "PUT", { elements: [] }, { "If-Match": before.etag }), 409,
       { error: "El diagrama ha alcanzado el limite de revisiones." });
     assert.equal(before.etag, `"${maximum}:${maximum}"`);
     assert.equal(before.body.diagram.revision, maximum);
@@ -190,16 +192,17 @@ test("public revision foundation and additive migrations", { timeout: 60_000 }, 
     assert.equal(await readFile(boundaryBackup, "utf8"), bytes);
   });
   await t.test("last representable increment succeeds once, then rejects invalid and overflowing scenes", async () => {
-    const saved = await request("/api/files/last", cookies.owner, "PUT", scene);
+    const prior = await request("/api/files/last", cookies.owner);
+    const saved = await request("/api/files/last", cookies.owner, "PUT", scene, { "If-Match": prior.etag });
     assert.equal(saved.status, 200);
     assert.equal(saved.etag, `"9007199254740995:${maximum}"`);
     const url = "/api/diagrams/9007199254740995";
     const before = await request(url, cookies.owner);
     const boundaryBackup = path.join(directory, "owner", "last.excalidraw.json");
     const bytes = await readFile(boundaryBackup, "utf8");
-    expect(await request("/api/files/last", cookies.owner, "PUT", {}), 400,
+    expect(await request("/api/files/last", cookies.owner, "PUT", {}, { "If-Match": before.etag }), 400,
       { error: "El contenido del diagrama no es valido." });
-    expect(await request("/api/files/last", cookies.owner, "PUT", { elements: [] }), 409,
+    expect(await request("/api/files/last", cookies.owner, "PUT", { elements: [] }, { "If-Match": before.etag }), 409,
       { error: "El diagrama ha alcanzado el limite de revisiones." });
     assert.deepEqual(await request(url, cookies.owner), before);
     assert.equal(await readFile(boundaryBackup, "utf8"), bytes);
@@ -207,17 +210,17 @@ test("public revision foundation and additive migrations", { timeout: 60_000 }, 
     await start();
     assert.deepEqual(await request(url, cookies.owner), before);
   });
-  await t.test("unguarded simultaneous replacements each increment once without claiming conflict protection", async () => {
+  await t.test("guarded simultaneous replacements allow only one matching revision",  async () => {
     const url = "/api/files/concurrent";
     const created = await request(url, cookies.owner, "PUT", scene);
     assert.equal(created.status, 200);
-    const pair = await Promise.all([request(url, cookies.owner, "PUT", scene),
-      request(url, cookies.owner, "PUT", scene)]);
-    assert.deepEqual(pair.map((result) => result.status), [200, 200]);
+    const pair = await Promise.all([request(url, cookies.owner, "PUT", scene, { "If-Match": created.etag }),
+      request(url, cookies.owner, "PUT", scene, { "If-Match": created.etag })]);
+    assert.deepEqual(pair.map((result) => result.status).sort(), [200, 412]);
     const freshId = created.etag.split(":")[0].slice(1);
-    assert.deepEqual(pair.map((result) => result.etag).sort(), [`"${freshId}:2"`, `"${freshId}:3"`]);
+    assert.equal(pair.find((result) => result.status === 200).etag, `"${freshId}:2"`);
     const loaded = await request(`/api/diagrams/${freshId}`, cookies.owner);
-    assert.equal(loaded.body.diagram.revision, "3");
+    assert.equal(loaded.body.diagram.revision, "2");
     assert.deepEqual(loaded.body.scene, scene);
   });
   await t.test("delete/recreate yields a new ID and token at revision one; create starts at one", async () => {

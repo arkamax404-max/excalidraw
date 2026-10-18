@@ -1,5 +1,9 @@
 # Application (frontend and server)
 
+**Backend-only intermediate — do not deploy yet.** Legacy replacements now require
+`If-Match`, but the existing UI does not send it until T3c1. No UI compatibility or
+browser verification is claimed here.
+
 The React frontend and the Express server of this self-hosted Excalidraw fork. See
 the repository root `README.md` for the deployment overview, the Compose workflow and
 the full environment-variable table.
@@ -52,8 +56,9 @@ the integration file directly is intentionally rejected: use the isolated runner
 `tests/helpers/persistence-fixture.mjs` supplies isolated accounts, real HTTP requests
 and public-state/backup snapshots for `tests/persistence.integration.mjs`. These
 regressions pin legacy raw-scene writes, revision tokens, shared reads and rejection
-non-effects. This test foundation adds no guarded save endpoint or lost-update
-protection; legacy replacements still accept writes without `If-Match`.
+non-effects, identity-bound replacements, normalized creation races and distinct-scene
+competition between the legacy and ID routes. Replacement callers supply known
+ETags explicitly; test helpers never fetch/retry the latest token automatically.
 
 ## HTTP API
 
@@ -91,8 +96,8 @@ IDs both return HTTP 404 with `{ error: "El diagrama solicitado no existe." }`.
 Both routes require a session (HTTP 401, `{ error: "Necesitas iniciar sesion." }`),
 even for malformed IDs. Being `admin` does not bypass ownership checks.
 
-These routes are read-only. Existing `/api/files` contracts and normalization are
-unchanged: overwrite retains the ID, while delete followed by recreation assigns
+These GET routes are read-only. Legacy read shapes and name normalization are
+unchanged: guarded overwrite retains the ID, while delete followed by recreation assigns
 a new ID. Membership never changes ownership; guarded ID replacement is described below.
 
 ### Revision foundation (T3a)
@@ -111,7 +116,7 @@ successful JSON bodies, list shape and raw scene request format remain unchanged
 At revision `9223372036854775807`, a valid legacy replacement returns HTTP **409**
 `{ error: "El diagrama ha alcanzado el limite de revisiones." }` without changing
 the scene, revision, timestamp or backup. Invalid scenes still return the existing
-400 error and change nothing. Other error contracts and access rules are unchanged.
+400 error and change nothing when supplied with the valid replacement precondition.
 
 Startup adds `revision BIGINT NOT NULL DEFAULT 1` and the named positive check
 constraint to fresh or existing databases. Old rows receive revision `1` without
@@ -120,11 +125,32 @@ rewriting IDs, scenes or timestamps. SQL-managed deployments can reapply
 (and 002 membership migration); both revision paths are idempotent. Substitute your
 schema for `excalidraw` in standalone SQL. Backups remain raw scenes, not metadata.
 
-**Incomplete feature:** legacy `/api/files` replacements remain blind and their
-backups remain uncoordinated, including against guarded saves. Legacy guards and
-frontend token handling await T3c; deletion/owner-directory failure ordering awaits
-T3d. Legacy backup failures retain their old error behavior. T3 is not complete;
-no global lost-update protection, cross-resource atomicity or durability is promised.
+### Guarded legacy create/replace (T3c0)
+
+`PUT /api/files/:name` still takes the raw scene and returns 200 `{ ok: true, file }`
+plus its strong ETag. Existing replacements require the same identity-bearing token
+and return the same 428/400/412 precondition errors as guarded ID saves below.
+Normalize the name before choosing its token: save-as never authorizes replacement
+of another existing document. A token for a deleted ID cannot recreate an absent
+name or overwrite a newly recreated identity. A malformed supplied token is 400;
+a valid supplied token for an absent name is 412, with no creation or backup write.
+
+A genuinely absent name may be created without a token at revision `1`. Competing
+normalized-name creates serialize: one creates; the loser sees an existing document
+and returns 428 `Debes indicar If-Match.`, without overwriting the winning scene.
+Both routes use the same owner/name lock and transactional replacement CAS, including
+backup completion. Legacy lookup remains owner-only: sharing never allows a member
+to write the owner's document by name; a token-free member save may create their own
+same-named document. Legacy saves now use the ID boundary's active database-owner
+check, rather than trusting an inactive/deleted owner's cached session.
+Creation authorization linearizes at INSERT's READ COMMITTED snapshot. Legacy
+replacement still consumes its historical sequence allocation, preserving IDs of
+later creates; IDs are not gapless.
+
+Legacy backup-only failures now use the canonical-success warning described below,
+without changing the normal success JSON shape. GET/list/membership routes remain
+unchanged. Frontend adaptation awaits T3c1; deletion/owner-directory coordination
+awaits T3d. No cross-resource atomicity or crash durability is promised.
 
 ### Guarded stable-ID replacement (T3b)
 
