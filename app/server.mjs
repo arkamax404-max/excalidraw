@@ -611,6 +611,92 @@ app.get("/api/diagrams/:id", requireAuth, async (request, response, next) => {
   }
 });
 
+// Session lock spans SQL commit AND backup completion; only guarded saves participate.
+const replaceDiagram = async (id, userId, match, scene) => {
+  const client = await pool.connect();
+  let lockKey;
+  let transaction = false;
+  let destroy = false;
+  const reject = (status, error) => ({ status, body: { error } });
+  const scoped = `SELECT diagrams.id, diagrams.user_id, diagrams.name, diagrams.revision,
+      owner.username, diagrams.updated_at
+    FROM ${DB_SCHEMA}.diagrams AS diagrams
+    JOIN ${DB_SCHEMA}.users AS owner ON owner.id = diagrams.user_id
+    WHERE diagrams.id = $2 AND ((diagrams.user_id = $1 AND owner.is_active) OR ${memberAccess})`;
+  try {
+    const initial = (await client.query(scoped, [userId, id])).rows[0];
+    if (!initial) return reject(404, "El diagrama solicitado no existe.");
+    const key = JSON.stringify([DB_SCHEMA, initial.user_id, sanitizeBaseName(initial.name)]);
+    await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [key]);
+    lockKey = key;
+    await client.query("BEGIN");
+    transaction = true;
+    const current = (await client.query(`${scoped} FOR UPDATE OF diagrams`, [userId, id])).rows[0];
+    if (!current || current.user_id !== initial.user_id || current.name !== initial.name) {
+      return reject(404, "El diagrama solicitado no existe.");
+    }
+    if (match === undefined) return reject(428, "Debes indicar If-Match.");
+    const parts = /^"([1-9][0-9]{0,18}):([1-9][0-9]{0,18})"$/.exec(match);
+    if (!parts || !isValidDiagramId(parts[1]) || !isValidDiagramId(parts[2])) {
+      return reject(400, "If-Match no es valido.");
+    }
+    if (match !== diagramETag(current)) return reject(412, "La version del diagrama no coincide.");
+    if (!isValidScene(scene)) return reject(400, "El contenido del diagrama no es valido.");
+    if (current.revision === "9223372036854775807") {
+      return reject(409, "El diagrama ha alcanzado el limite de revisiones.");
+    }
+    // Authorization linearizes at this statement's READ COMMITTED snapshot.
+    const result = await client.query(
+      `UPDATE ${DB_SCHEMA}.diagrams AS diagrams
+       SET scene_json = $3::jsonb, revision = diagrams.revision + 1, updated_at = NOW()
+       FROM ${DB_SCHEMA}.users AS owner
+       WHERE diagrams.id = $2 AND owner.id = diagrams.user_id AND diagrams.revision = $4
+         AND ((diagrams.user_id = $1 AND owner.is_active) OR ${memberAccess})
+       RETURNING diagrams.id, diagrams.name, diagrams.revision, diagrams.updated_at`,
+      [userId, id, JSON.stringify(scene), current.revision],
+    );
+    if (!result.rowCount) return reject(404, "El diagrama solicitado no existe.");
+    await client.query("COMMIT");
+    transaction = false;
+    const diagram = result.rows[0];
+    const body = { ok: true, diagram: getDiagramPayload(diagram) };
+    try {
+      await writeDiagramBackup(current.username, current.name, scene);
+    } catch (error) {
+      console.error("Canonical diagram saved; backup failed.", error);
+      body.warning = "diagram-backup-failed";
+    }
+    return { status: 200, body, etag: diagramETag(diagram) };
+  } catch (error) {
+    destroy = true; // A failed/uncertain query must not return a locked session to the pool.
+    throw error;
+  } finally {
+    if (transaction) {
+      try { await client.query("ROLLBACK"); }
+      catch (error) { destroy = true; console.error("Diagram rollback failed.", error); }
+    }
+    if (lockKey && !destroy) {
+      try { await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [lockKey]); }
+      catch (error) { destroy = true; console.error("Diagram unlock failed.", error); }
+    }
+    client.release(destroy);
+  }
+};
+
+app.put("/api/diagrams/:id", requireAuth, async (request, response, next) => {
+  if (!isValidDiagramId(request.params.id)) {
+    response.status(400).json({ error: "El identificador de diagrama no es valido." });
+    return;
+  }
+  try {
+    const result = await replaceDiagram(request.params.id, request.session.user.id,
+      request.get("If-Match"), request.body);
+    if (result.etag) response.set("ETag", result.etag);
+    if (result.body.warning) response.set("X-Backup-Warning", result.body.warning);
+    response.status(result.status).json(result.body);
+  } catch (error) { next(error); }
+});
+
 const requireDiagramOwner = async (request, response, next) => {
   if (!isValidDiagramId(request.params.id)) {
     response.status(400).json({ error: "El identificador de diagrama no es valido." });

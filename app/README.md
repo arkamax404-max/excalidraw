@@ -66,6 +66,7 @@ authentication routes requires an authenticated session.
 | `GET/POST/PUT/DELETE /api/admin/users` | User management; requires the account named exactly `admin` |
 | `GET /api/files`, `GET/PUT/DELETE /api/files/:name` | Per-user diagram storage; `PUT` takes the raw scene object |
 | `GET /api/diagrams`, `GET /api/diagrams/:id` | Owner/member stable-ID discovery and loading (contracts below) |
+| `PUT /api/diagrams/:id` | Guarded owner/member raw-scene replacement with identity-bearing `If-Match` |
 | `GET/POST /api/diagrams/:id/members`, `DELETE /api/diagrams/:id/members/:username` | Owner-only membership administration |
 | `POST /api/ai/diagram` | Prompt to Mermaid through OpenRouter with the Groq fallback chain |
 
@@ -92,7 +93,7 @@ even for malformed IDs. Being `admin` does not bypass ownership checks.
 
 These routes are read-only. Existing `/api/files` contracts and normalization are
 unchanged: overwrite retains the ID, while delete followed by recreation assigns
-a new ID. Membership never changes ownership; there is no ID-oriented save endpoint yet.
+a new ID. Membership never changes ownership; guarded ID replacement is described below.
 
 ### Revision foundation (T3a)
 
@@ -119,12 +120,54 @@ rewriting IDs, scenes or timestamps. SQL-managed deployments can reapply
 (and 002 membership migration); both revision paths are idempotent. Substitute your
 schema for `excalidraw` in standalone SQL. Backups remain raw scenes, not metadata.
 
-**Foundation only:** replacements are still unguarded; `If-Match` is not enforced
-until T3c. Shared stable-ID saves/CAS (T3b), frontend token handling (T3c), and
-ordered deletion/failure closure (T3d) remain pending. This slice does not prevent
-lost updates or coordinate concurrent backups. Backup failures still use the old
-error behavior; canonical-success/backup-warning handling is not implemented yet.
-T3 as a whole is incomplete; no cross-resource atomicity or durability is promised.
+**Incomplete feature:** legacy `/api/files` replacements remain blind and their
+backups remain uncoordinated, including against guarded saves. Legacy guards and
+frontend token handling await T3c; deletion/owner-directory failure ordering awaits
+T3d. Legacy backup failures retain their old error behavior. T3 is not complete;
+no global lost-update protection, cross-resource atomicity or durability is promised.
+
+### Guarded stable-ID replacement (T3b)
+
+`PUT /api/diagrams/:id` takes the raw full scene, including tombstones and files.
+It never creates a missing ID, merges scenes, retries a canonical write or changes
+ownership. Success is 200 `{ ok: true, diagram }`, with the same metadata shape as
+ID reads and the new strong ETag; the exact BIGINT revision increases once.
+Only a currently active database owner or active registered member may save;
+`admin` has no bypass, and an existing session does not preserve revoked access.
+
+Validation order is authentication, canonical ID, scoped database access (rechecked
+after coordination), precondition, scene, then overflow. Errors return `{ error }`:
+
+| Condition | Status and error |
+| --- | --- |
+| Missing `If-Match` | 428 `Debes indicar If-Match.` |
+| Malformed `If-Match` | 400 `If-Match no es valido.` |
+| Wrong identity or stale revision | 412 `La version del diagrama no coincide.` |
+
+`If-Match` must be exactly one strong `"<id>:<revision>"` token. Both components
+use the canonical positive BIGINT range documented above: weak tags, wildcard,
+lists, zero, leading zeros, signs, fractions, exponents and out-of-range values
+are rejected. HTTP framing whitespace is handled by the HTTP parser. Authentication,
+ID, missing/inaccessible, scene and overflow errors retain their existing messages.
+Inaccessible targets expose neither a document token nor precondition details.
+
+The exercised `replaceDiagram` persistence boundary uses a dedicated PostgreSQL
+session advisory lock keyed by stored owner ID and normalized stored name (with
+schema namespace). It rechecks identity/access/revision under that lock, locks the
+row, and performs a transactional CAS. Authorization linearizes at the UPDATE's
+READ COMMITTED snapshot: a later revocation need not cancel an already authorized
+save. Membership mutation code is unchanged. The session lock remains held through
+commit and awaited backup completion, ordering participating guarded backups; the
+backup username/name come from the stored owner join, never the acting member.
+Rollback/error paths release the session; failed rollback/unlock destroys it.
+
+If only backup writing fails after commit, return canonical success and the new
+ETag with `X-Backup-Warning: diagram-backup-failed` and
+`warning: "diagram-backup-failed"`; the server logs the failure without exposing
+filesystem details to clients. Retrying the old token returns 412. A connection
+loss during COMMIT can leave the outcome unknown: reload canonical data before a
+user-directed retry; there is no blind retry or rollback guarantee for that case.
+Backups have no fsync/crash-atomicity or repair-queue guarantee.
 
 ### Owner-controlled memberships
 
@@ -151,7 +194,7 @@ Only active registered members receive shared reads; revocation applies to the n
 HTTP list/load, including existing sessions. Inactive memberships remain listed and
 can be revoked, but confer no shared reads. Owners always retain access. Deleting a
 member account removes its memberships, not others' diagrams; deleting an owner or
-diagram cascades its memberships. Realtime eviction and shared saves remain T4/T3.
+diagram cascades its memberships. Realtime eviction remains T4; guarded shared saves use the T3b route above.
 
 ### Membership migration
 

@@ -41,14 +41,14 @@ export const persistenceFixture = async (t) => {
   assert.match(output, /Excalidraw auth server listening/);
 
   const cookies = {};
-  const request = async (route, user, method = "GET", body) => {
+  const request = async (route, user, method = "GET", body, headers = {}) => {
     const response = await fetch(`http://127.0.0.1:3035${route}`, {
       method,
-      headers: { "Content-Type": "application/json", ...(user ? { Cookie: cookies[user] } : {}) },
+      headers: { "Content-Type": "application/json", ...(user ? { Cookie: cookies[user] } : {}), ...headers },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
     return { status: response.status, body: await response.json(),
-      etag: response.headers.get("etag"), cookie: response.headers.get("set-cookie")?.split(";")[0] };
+      etag: response.headers.get("etag"), warning: response.headers.get("x-backup-warning"), cookie: response.headers.get("set-cookie")?.split(";")[0] };
   };
   const hash = await bcrypt.hash("fixture-password", 4);
   for (const username of ["owner", "member", "stranger", "admin"]) {
@@ -80,5 +80,6 @@ export const persistenceFixture = async (t) => {
     state.backups = await backupTree();
     return state;
   };
-  return { request, snapshot };
+  const setup = (sql, values) => pool.query(sql.replaceAll("fixture_schema", schema), values);
+  return { request, snapshot, setup, directory, logs: () => output };
 };
