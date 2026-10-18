@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { persistenceFixture } from "./helpers/persistence-fixture.mjs";
 import { realtimeOrigin, realtimeResult } from "./helpers/realtime-client.mjs";
+import { realtimePeer } from "./helpers/realtime-peer.mjs";
 
 const scene = { elements: [{ id: "retained", isDeleted: true }],
   files: { image: { id: "image", dataURL: "data:image/png;base64,AA==" } }, appState: {} };
@@ -47,6 +48,36 @@ test("realtime upgrade uses current private permissions without persistence effe
   await t.test("owner and registered member receive only exact ready identity", async (t) => {
     for (const user of ["owner", "member"]) {
       await t.test(user, () => check(id, cookie(user), [101]));
+    }
+  });
+  await t.test("persistent peers retain exact ready identity and reject unsupported data", async (t) => {
+    for (const [name, user, data] of [
+      ["UTF-8 text", "owner", "unsupported-é"],
+      ["binary", "member", Buffer.from([0, 1, 255])],
+      ["JSON", "member", { type: "unsupported" }],
+    ]) {
+      await t.test(name, async () => {
+        const before = await snapshot();
+        const peer = realtimePeer(id, f.cookieFor(user));
+        try {
+          const ready = await peer.next();
+          assert.equal(ready.type, "message");
+          assert.equal(ready.binary, false);
+          assert.deepEqual(ready.data, Buffer.from(JSON.stringify({ type: "ready", diagramId: id }), "utf8"));
+          peer.send(data);
+          // Close is the processing boundary: any extra application frame fails here.
+          const closed = await peer.next();
+          assert.equal(closed.type, "close");
+          assert.equal(closed.code, 1008);
+          assert.equal(closed.reason, "No data protocol yet");
+        } finally {
+          try {
+            await peer.dispose();
+          } finally {
+            assert.deepEqual(await snapshot(), before);
+          }
+        }
+      });
     }
   });
   await t.test("anonymous and forged session cookies require authentication", async (t) => {

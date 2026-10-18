@@ -102,6 +102,10 @@ ETag advancement or WebSocket-driven session renewal. HTTP remains the sole guar
 scene-write authority. Continuous invalidation, relay and editor convergence await
 T4b–d/T5–T6; this slice is **not deployment approval**. The isolated API suite covers
 real-cookie upgrades/rejections and unchanged document, account-counter and backup state.
+Persistent real-cookie test peers also check exact UTF-8 ready identity and unsupported
+text, binary and JSON data closing with 1008 (`No data protocol yet`), without extra frames.
+Close events bound these checks; canonical scenes, ETags, revisions, accounts, memberships
+and backup bytes stay unchanged. This fixture adds no application behavior or relay claim.
 
 ### Stable-ID reads
 
