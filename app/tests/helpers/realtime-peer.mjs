@@ -2,10 +2,10 @@ import WebSocket from "ws";
 import { realtimeOrigin } from "./realtime-client.mjs";
 
 // One bounded event queue, including terminal events; no background promise chain.
-export const realtimePeer = (id, cookie) => {
+export const realtimePeer = (id, cookie, { compression = false } = {}) => {
   const socket = new WebSocket(`${realtimeOrigin.replace("http:", "ws:")}/api/realtime/diagrams/${id}`, {
     headers: { Cookie: cookie, Origin: realtimeOrigin },
-    perMessageDeflate: false, handshakeTimeout: 2000,
+    perMessageDeflate: compression, handshakeTimeout: 2000,
   });
   const queue = [];
   let waiting;
@@ -31,8 +31,8 @@ export const realtimePeer = (id, cookie) => {
     finishClose?.();
   };
   socket.on("message", onMessage).on("error", onError).once("close", onClose);
-  const next = () => {
-    if (queue.length) return Promise.resolve(queue.shift());
+  const next = (consume = true) => {
+    if (queue.length) return Promise.resolve(consume ? queue.shift() : queue[0]);
     if (ended || disposed) return Promise.reject(new Error("Realtime peer is closed"));
     if (waiting) return Promise.reject(new Error("Concurrent realtime reads are unsupported"));
     return new Promise((resolve, reject) => {
@@ -40,7 +40,11 @@ export const realtimePeer = (id, cookie) => {
         waiting = undefined;
         reject(new Error("Realtime event deadline exceeded"));
       }, 3000);
-      waiting = (event) => { clearTimeout(timer); waiting = undefined; resolve(event); };
+      waiting = (event) => {
+        clearTimeout(timer); waiting = undefined;
+        if (!consume && event.type !== "cancelled") queue.unshift(event);
+        resolve(event);
+      };
     });
   };
   const dispose = async () => {
@@ -57,8 +61,10 @@ export const realtimePeer = (id, cookie) => {
       socket.terminate();
     });
   };
-  return { next, dispose, send: (value) => {
+  return { next, dispose, cancelRead: () => waiting?.({ type: "cancelled" }),
+    get open() { return socket.readyState === WebSocket.OPEN; },
+    get extensions() { return socket.extensions; }, send: (value, options) => {
     if (socket.readyState !== WebSocket.OPEN) throw new Error("Realtime peer is not open");
-    socket.send(typeof value === "string" || Buffer.isBuffer(value) ? value : JSON.stringify(value));
+    socket.send(typeof value === "string" || Buffer.isBuffer(value) ? value : JSON.stringify(value), options);
   } };
 };

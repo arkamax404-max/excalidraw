@@ -224,6 +224,7 @@ await bootstrapDatabase();
 
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "25mb" }));
+const sessionTable = "user_sessions";
 const sessionMiddleware = session({
     name: "excalidraw.sid",
     secret: SESSION_SECRET,
@@ -239,7 +240,7 @@ const sessionMiddleware = session({
     store: new PgStore({
       pool,
       schemaName: DB_SCHEMA,
-      tableName: "user_sessions",
+      tableName: sessionTable,
       createTableIfMissing: true,
       ttl: SESSION_TTL_SECONDS,
     }),
@@ -984,5 +985,5 @@ const server = app.listen(PORT, () => {
   console.log(`PostgreSQL schema: ${DB_SCHEMA}`);
   console.log(`Data directory: ${DATA_DIR}`);
 });
-attachRealtime(server, { sessionMiddleware, pool, schema: DB_SCHEMA,
+attachRealtime(server, { sessionMiddleware, pool, schema: DB_SCHEMA, sessionTable,
   trustProxy: app.get("trust proxy fn") });

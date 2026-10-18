@@ -10,7 +10,7 @@ import bcrypt from "bcryptjs";
 import pg from "pg";
 import { backupPaths } from "./backup-paths.mjs";
 
-export const persistenceFixture = async (t, { seedData } = {}) => {
+export const persistenceFixture = async (t, { seedData, realtime = false } = {}) => {
   assert.equal(process.env.API_TEST_ISOLATED, "1", "Use npm run test:api");
   const schema = `persistence_${randomUUID().replaceAll("-", "")}`;
   const directory = await mkdtemp(path.join(tmpdir(), "excalidraw-persistence-"));
@@ -28,6 +28,7 @@ export const persistenceFixture = async (t, { seedData } = {}) => {
   if (seedData) await seedData(directory);
   let output = "";
   server = spawn(process.execPath, ["--import", fileURLToPath(new URL("./storage-barrier.mjs", import.meta.url)),
+    ...(realtime ? ["--import", fileURLToPath(new URL("./realtime-barrier.mjs", import.meta.url))] : []),
     fileURLToPath(new URL("../../server.mjs", import.meta.url))], {
     env: { ...process.env, PORT: "3035", PGSCHEMA: schema, DATA_DIR: directory,
       PGSSL: "false", PGAPPNAME: schema, SESSION_SECRET: "isolated-persistence-secret",
@@ -105,6 +106,28 @@ export const persistenceFixture = async (t, { seedData } = {}) => {
     t.after(release);
     return { blocked, release };
   };
+  const realtimeGate = async () => {
+    assert.equal(realtime, true, "Realtime preload must be explicitly enabled");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    const wait = async (kind) => {
+      for (;;) {
+        const [event] = await once(server, "message", { signal: controller.signal });
+        if (event.realtime === kind) return;
+      }
+    };
+    const ready = wait("armed");
+    server.send({ realtime: "arm" });
+    const release = (pressure = false) => {
+      clearTimeout(timer); controller.abort();
+      if (server.connected) server.send({ realtime: "release", pressure });
+    };
+    t.after(() => release());
+    await ready;
+    const blocked = wait("blocked");
+    blocked.catch(() => {}); // Teardown cancellation is always consumed.
+    return { blocked, release };
+  };
   const blocked = async (count) => {
     const deadline = Date.now() + 5000;
     do {
@@ -143,5 +166,5 @@ export const persistenceFixture = async (t, { seedData } = {}) => {
     accounts[alias] = login.body.user;
   };
   return { request, snapshot, setup, directory, users, storageBarrier, blocked, documentLock,
-    directoryLock, loginAs, backups, cookieFor: (user) => cookies[user], logs: () => output };
+    directoryLock, loginAs, backups, realtimeGate, cookieFor: (user) => cookies[user], logs: () => output };
 };

@@ -4,6 +4,64 @@ import { persistenceFixture } from "./helpers/persistence-fixture.mjs";
 import { realtimeOrigin, realtimeResult } from "./helpers/realtime-client.mjs";
 import { realtimePeer } from "./helpers/realtime-peer.mjs";
 
+const sync = { type: "sync_request", payload: {} };
+const limit = 25 * 1024 * 1024;
+const identities = new WeakMap();
+const relay = async (sender, recipient, userId, value = sync) => {
+  try {
+    const received = Promise.race([sender.next(false).then((event) => ({ ...event, echo: true })), recipient.next()]);
+    if (typeof value === "function") value(); else sender.send(value);
+    const event = await received;
+    assert.equal(event.type, "message", `expected relay, got ${JSON.stringify(event)}`);
+    assert.equal(event.echo, undefined, "no sender echo");
+    assert.equal(event.binary, false);
+    const frame = JSON.parse(event.data.toString("utf8"));
+    assert.equal(typeof frame.sender?.peerId, "string");
+    assert.ok(frame.sender.peerId.length > 0);
+    const peerId = identities.get(sender) ?? frame.sender.peerId;
+    assert.deepEqual(frame, { ...sync, sender: { userId: String(userId), peerId } });
+    identities.set(sender, peerId);
+  } finally { sender.cancelRead(); recipient.cancelRead(); }
+};
+const closed = async (peer, code, reason) => {
+  const event = await peer.next();
+  assert.equal(event.type, "close", "no application frame before close");
+  assert.equal(event.code, code);
+  if (reason) assert.equal(event.reason, reason);
+};
+const syncFixture = async (t, body) => {
+  const f = await persistenceFixture(t, { realtime: true });
+  for (const user of ["owner", "stranger"]) assert.equal((await f.request("/api/files/shared", user, "PUT", scene)).status, 200);
+  const id = (await f.request("/api/diagrams", "owner")).body.diagrams[0].id;
+  const other = (await f.request("/api/diagrams", "stranger")).body.diagrams[0].id;
+  const route = `/api/diagrams/${id}`;
+  assert.equal((await f.request(`${route}/members`, "owner", "POST", { username: "member" })).status, 201);
+  const snapshot = async () => ({ documents: await f.snapshot(id, "shared"),
+    control: await f.request(`/api/diagrams/${other}`, "stranger"),
+    accounts: await f.request("/api/admin/users", "admin"), members: await f.request(`${route}/members`, "owner") });
+  let expected = await snapshot();
+  const peers = [];
+  const open = async (user, room = id) => {
+    const peer = realtimePeer(room, f.cookieFor(user), { compression: true });
+    peers.push(peer);
+    const ready = await peer.next();
+    assert.equal(ready.type, "message"); assert.equal(ready.binary, false);
+    assert.deepEqual(ready.data, Buffer.from(JSON.stringify({ type: "ready", diagramId: room })));
+    assert.equal(peer.extensions, "", "compression must not be negotiated");
+    return peer;
+  };
+  try {
+    const a = await open("owner"), b = await open("member");
+    const c = await open("stranger", other), d = await open("stranger", other);
+    // Mandatory fast old-server boundary BEFORE arming a not-yet-existing SQL marker.
+    await relay(a, b, f.users.owner); await relay(b, a, f.users.member);
+    await body({ f, a, b, c, d, route, open, checkpoint: async () => { expected = await snapshot(); } });
+  } finally {
+    try { await Promise.all(peers.map((peer) => peer.dispose())); }
+    finally { assert.deepEqual(await snapshot(), expected); }
+  }
+};
+
 const scene = { elements: [{ id: "retained", isDeleted: true }],
   files: { image: { id: "image", dataURL: "data:image/png;base64,AA==" } }, appState: {} };
 
@@ -126,4 +184,89 @@ test("realtime upgrade uses current private permissions without persistence effe
       });
     }
   });
+});
+
+test("sync_request has a current private bounded delivery gate", { timeout: 240_000 }, async (t) => {
+  await t.test("bidirectional stable identity, no echo and no cross-room disclosure", (t) => syncFixture(t, async ({ f, a, b, c, d, open }) => {
+    await relay(a, b, f.users.owner); await relay(b, a, f.users.member); await relay(b, a, f.users.member);
+    assert.notEqual(identities.get(a), identities.get(b));
+    for (const peer of [a, b, c, d]) { peer.send("unsupported"); await closed(peer, 1008, "No data protocol yet"); }
+    const nextOwner = await open("owner"), nextMember = await open("member");
+    await relay(nextOwner, nextMember, f.users.owner);
+    assert.notEqual(identities.get(nextOwner), identities.get(a), "peer identity is per connection, not per account");
+  }));
+  const invalid = ["{", "1", "null", "[]", Buffer.from(JSON.stringify(sync)), { type: "sync_request" }, { payload: {} },
+    ...[null, [], 1, "", true, { unknown: 1 }].map((payload) => ({ ...sync, payload })),
+    ...["sender", "room", "session", "target", "revision", "ETag", "etag", "unknown"].map((key) => ({ ...sync, [key]: "forged" })),
+    ...["scene", "pointer", "files"].map((type) => ({ ...sync, type }))];
+  for (const [index, value] of invalid.entries()) await t.test(`strict envelope rejection ${index}`, (t) => syncFixture(t, async ({ a, b }) => {
+    a.send(value); await closed(a, 1008, "No data protocol yet");
+    b.send("unsupported"); await closed(b, 1008, "No data protocol yet");
+  }));
+  for (const fragmented of [false, true]) await t.test(`25MiB UTF-8 aggregate boundary, fragmented=${fragmented}`, (t) => syncFixture(t, async ({ f, a, b }) => {
+    const raw = JSON.stringify(sync).padEnd(limit, " ");
+    const send = (text) => fragmented ? (a.send(text.slice(0, limit / 2), { fin: false }), a.send(text.slice(limit / 2), { fin: true })) : a.send(text);
+    await relay(a, b, f.users.owner, () => send(raw));
+    send(raw + " "); await closed(a, 1009);
+    b.send("unsupported"); await closed(b, 1008);
+  }));
+  const mutations = [
+    ["logout", async (f) => assert.equal((await f.request("/api/auth/logout", "member", "POST")).status, 200)],
+    ["destroyed session", (f) => f.setup("DELETE FROM fixture_schema.user_sessions WHERE sess::jsonb#>>'{user,id}'=$1", [String(f.users.member)])],
+    ["expired session", (f) => f.setup("UPDATE fixture_schema.user_sessions SET expire=NOW()-INTERVAL '1 second' WHERE sess::jsonb#>>'{user,id}'=$1", [String(f.users.member)])],
+    ["changed stored identity", (f) => f.setup("UPDATE fixture_schema.user_sessions SET sess=jsonb_set(sess::jsonb,'{user,id}',to_jsonb($1::text)) WHERE sess::jsonb#>>'{user,id}'=$2", [String(f.users.owner), String(f.users.member)])],
+    ...["member", "owner"].flatMap((user) => [
+      [`inactive ${user}`, async (f) => assert.equal((await f.request(`/api/admin/users/${f.users[user]}`, "admin", "PUT", { isActive: false })).status, 200)],
+      [`deleted ${user}`, async (f) => assert.equal((await f.request(`/api/admin/users/${f.users[user]}`, "admin", "DELETE")).status, 200)]]),
+    ["revoked member", async (f, route) => assert.equal((await f.request(`${route}/members/member`, "owner", "DELETE")).status, 200)],
+    ["deleted diagram", async (f) => assert.equal((await f.request("/api/files/shared", "owner", "DELETE")).status, 200)],
+  ];
+  for (const [name, mutate] of mutations) for (const recipient of [false, true]) await t.test(`${name}: fresh ${recipient ? "recipient" : "sender"} authorization`, (t) => syncFixture(t, async ({ f, a, b, c, d, route, open, checkpoint }) => {
+    await mutate(f, route); await checkpoint();
+    if (recipient && !name.includes("owner") && name !== "deleted diagram") {
+      const valid = await open("owner"); await relay(a, valid, f.users.owner);
+    } else if (recipient) a.send(sync);
+    if (b.open) b.send(sync); await closed(b, 1008); // Bounds absence even if invalidation already closed it.
+    if (a.open) a.send("unsupported"); await closed(a, 1008);
+    await relay(c, d, f.users.stranger); // Unaffected peers must still work.
+  }));
+  for (const recipient of [false, true]) for (const commitFirst of [false, true]) await t.test(`revocation linearization: recipient=${recipient}, commitFirst=${commitFirst}`, (t) => syncFixture(t, async ({ f, a, b, route, checkpoint }) => {
+    if (commitFirst) {
+      assert.equal((await f.request(`${route}/members/member`, "owner", "DELETE")).status, 200); await checkpoint();
+      if (recipient) a.send(sync);
+    } else {
+      const sender = recipient ? a : b, target = recipient ? b : a;
+      const gate = await f.realtimeGate();
+      try {
+        sender.send(sync); await gate.blocked;
+        const revoking = f.request(`${route}/members/member`, "owner", "DELETE"); revoking.catch(() => {});
+        await f.blocked(1); // Public revoke is blocked by held authorization row locks.
+        gate.release();
+        const event = await target.next(); assert.equal(event.type, "message");
+        assert.deepEqual(JSON.parse(event.data), { ...sync, sender: { userId: String(f.users[recipient ? "owner" : "member"]), peerId: identities.get(sender) } });
+        assert.equal((await revoking).status, 200); await checkpoint();
+        if (recipient) a.send(sync);
+      } finally { gate.release(); }
+    }
+    if (b.open) b.send(sync); await closed(b, 1008);
+    if (a.open) a.send("unsupported"); await closed(a, 1008);
+  }));
+  for (const mode of ["eight pending", "nine pending", "byte overload", "outbound pressure", "disconnect"]) await t.test(mode, (t) => syncFixture(t, async ({ f, a, b }) => {
+    const gate = await f.realtimeGate();
+    try {
+      a.send(sync); await gate.blocked;
+      if (mode === "disconnect") await a.dispose();
+      else if (mode === "byte overload") for (let i = 0; i < 2; i++) a.send(JSON.stringify(sync).padEnd(limit / 2 + 1, " "));
+      else if (mode !== "outbound pressure") for (let i = 0; i < (mode === "eight pending" ? 8 : 9); i++) a.send(sync);
+      if (mode === "nine pending" || mode === "byte overload") await closed(a, 1013);
+      gate.release(mode === "outbound pressure"); // Controlled transport-buffer fault, not a TCP throughput claim.
+      if (mode === "eight pending") for (let i = 0; i < 9; i++) {
+        const event = await b.next(); assert.equal(event.type, "message");
+        assert.deepEqual(JSON.parse(event.data), { ...sync, sender: { userId: String(f.users.owner), peerId: identities.get(a) } });
+      } // Count/serialization only: empty controls cannot prove distinguishable payload order.
+      if (mode === "outbound pressure") await closed(b, 1013);
+      else { b.send("unsupported"); await closed(b, 1008); }
+      if (mode === "eight pending" || mode === "outbound pressure") { a.send("unsupported"); await closed(a, 1008); }
+    } finally { gate.release(); }
+  }));
 });

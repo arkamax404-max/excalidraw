@@ -80,7 +80,7 @@ Diagram names are normalized server-side: NFKC, runs of characters outside
 the result is lowercased, truncated to 80 characters, and an empty result becomes
 `diagrama-1`.
 
-### Realtime upgrade (T4a)
+### Realtime transport (T4a/T4b1a)
 
 Connect to `ws(s)://<same-host>/api/realtime/diagrams/:id` with the existing signed
 `excalidraw.sid` login cookie and an explicit same-origin HTTP(S) `Origin` header.
@@ -89,23 +89,30 @@ be active; only the owner or a registered member can upgrade, with no admin bypa
 The existing one-hop trusted proxy protocol is respected for TLS termination; preserve
 `Host` when proxying. `X-Forwarded-Host` does not authorize a different origin.
 
-A successful HTTP 101 sends only the UTF-8 JSON frame
+A successful HTTP 101 first sends the UTF-8 JSON frame
 `{"type":"ready","diagramId":"<exact-id>"}`. Upgrade denials close with an empty
 body: 401 for missing/invalid sessions or inactive actors, 400 for invalid IDs,
 404 for missing/inaccessible rooms or inactive owners, and 403 for missing, opaque
 or mismatched Origin. Internal failures return an empty 500; malformed WebSocket
 handshakes return an empty 400. Origin is checked before session and room access.
 
-Compression is disabled and incoming payloads are capped at 1 KiB. Data frames close
-the connection: there is no relay, scene/file/revision payload, persistence write,
-ETag advancement or WebSocket-driven session renewal. HTTP remains the sole guarded
-scene-write authority. Continuous invalidation, relay and editor convergence await
-T4b–d/T5–T6; this slice is **not deployment approval**. The isolated API suite covers
-real-cookie upgrades/rejections and unchanged document, account-counter and backup state.
-Persistent real-cookie test peers also check exact UTF-8 ready identity and unsupported
-text, binary and JSON data closing with 1008 (`No data protocol yet`), without extra frames.
-Close events bound these checks; canonical scenes, ETags, revisions, accounts, memberships
-and backup bytes stay unchanged. This fixture adds no application behavior or relay claim.
+Clients may send exactly `{"type":"sync_request","payload":{}}`. Other peers in the
+same room receive that type/payload plus `sender:{userId,peerId}`: the exact account ID
+and a server-generated per-connection identity. There is no echo or cross-room delivery.
+Unknown fields/kinds, malformed/scalar JSON and binary data close with 1008
+(`No data protocol yet`). Scene, pointer and file messages remain unsupported.
+Compression is disabled. Input (including fragmented messages) and encoded output are
+capped at 25 MiB; oversize input closes with 1009. Each sender has at most eight pending
+messages/25 MiB, excluding in-flight work. Queue overflow or recipient buffered output
+plus a frame exceeding 25 MiB closes the affected connection with 1013.
+Every delivery freshly locks both sessions, active actors/owner, room and memberships
+through synchronous enqueue, with expiry rechecked immediately beforehand. Invalid
+recipients are excluded without disconnecting valid peers. No session is renewed.
+Idle/event-driven invalidation and editor convergence remain future T4c–d/T5–T6 work.
+HTTP remains the sole guarded scene/revision/ETag authority; there is no WS persistence,
+scene/file cache or backup change. API regressions cover real cookies, close boundaries,
+revocation overlap and canonical/account/membership/backup non-effects. Controlled buffer
+faults test backpressure, not TCP throughput. This is **not deployment approval**.
 
 ### Stable-ID reads
 

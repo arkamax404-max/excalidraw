@@ -1,4 +1,5 @@
 import { STATUS_CODES } from "node:http";
+import { randomUUID } from "node:crypto";
 import { WebSocketServer } from "ws";
 
 const canonicalId = (id) => typeof id === "string" &&
@@ -28,8 +29,83 @@ const rejectUpgrade = (socket, status) => {
   }
 };
 
-export const attachRealtime = (server, { sessionMiddleware, pool, schema, trustProxy }) => {
-  const realtime = new WebSocketServer({ noServer: true, maxPayload: 1024, perMessageDeflate: false });
+export const attachRealtime = (server, { sessionMiddleware, pool, schema, sessionTable, trustProxy }) => {
+  const limit = 25 * 1024 * 1024;
+  const realtime = new WebSocketServer({ noServer: true, maxPayload: limit, perMessageDeflate: false });
+  const peers = new Set();
+  const live = (peer) => peer.socket.readyState === 1;
+  const close = (peer, code = 1008, reason = "Access denied") => {
+    peer.queue.length = 0; peer.bytes = 0;
+    if (live(peer)) peer.socket.close(code, reason);
+  };
+  const deliver = async (sender, recipient, frame) => {
+    if (!live(sender)) return;
+    let connection;
+    try {
+      connection = await pool.connect();
+      await connection.query("BEGIN");
+      const owner = (await connection.query(`SELECT user_id FROM ${schema}.diagrams WHERE id=$1`, [sender.id])).rows[0]?.user_id;
+      // Same PgStore table, no get/touch/save: lock SIDs, numeric users, room, memberships.
+      const sessions = (await connection.query(`SELECT sid, sess, EXTRACT(EPOCH FROM expire::timestamptz) AS expires
+        FROM ${schema}.${sessionTable} WHERE sid=ANY($1::text[]) ORDER BY sid FOR SHARE`,
+      [[sender.sid, recipient?.sid].filter(Boolean)])).rows;
+      const actors = [...new Set([sender.actor, recipient?.actor, owner].filter(Boolean))];
+      const users = (await connection.query(`SELECT id, is_active FROM ${schema}.users
+        WHERE id=ANY($1::bigint[]) ORDER BY id FOR SHARE`, [actors])).rows;
+      const room = (await connection.query(`SELECT user_id FROM ${schema}.diagrams WHERE id=$1 FOR SHARE`, [sender.id])).rows[0];
+      const members = (await connection.query(`SELECT ${recipient ? "/* realtime:enqueue */" : ""} user_id
+        FROM ${schema}.diagram_members WHERE diagram_id=$1 AND user_id=ANY($2::bigint[]) ORDER BY user_id FOR SHARE`,
+      [sender.id, [sender.actor, recipient?.actor].filter(Boolean)])).rows;
+      // Everything below, including enqueue, is synchronous while all rows remain locked.
+      const now = Math.ceil(Date.now() / 1000);
+      const active = (id) => users.some((user) => user.id === id && user.is_active);
+      const valid = (peer) => sessions.some((row) => row.sid === peer.sid &&
+        row.sess?.user?.id === peer.actor && Number(row.expires) >= now) && active(peer.actor) &&
+        (peer.actor === owner || members.some((member) => member.user_id === peer.actor));
+      if (!room || room.user_id !== owner || !active(owner)) {
+        for (const peer of peers) if (peer.id === sender.id) close(peer);
+        return;
+      }
+      if (!valid(sender)) return close(sender);
+      if (recipient && !valid(recipient)) return close(recipient);
+      if (!live(sender) || !recipient || !live(recipient)) return;
+      if (Buffer.byteLength(frame) > limit) return close(sender, 1009, "Message too large");
+      if (recipient.socket.bufferedAmount + Buffer.byteLength(frame) > limit) return close(recipient, 1013, "Backpressure");
+      recipient.socket.send(frame);
+    } catch {
+      close(sender);
+      if (recipient) close(recipient);
+    } finally {
+      if (connection) {
+        try { await connection.query("ROLLBACK"); connection.release(); }
+        catch (error) {
+          connection.release(error); close(sender);
+          if (recipient) close(recipient);
+        }
+      }
+    }
+  };
+  const drain = async (peer) => {
+    peer.busy = true;
+    try {
+      while (peer.queue.length && live(peer)) {
+        const { data, binary } = peer.queue.shift(); peer.bytes -= data.length;
+        let value;
+        try { value = JSON.parse(data.toString("utf8")); } catch { /* Reject through the same policy below. */ }
+        if (binary || !value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length !== 2 ||
+            value.type !== "sync_request" || !value.payload || typeof value.payload !== "object" ||
+            Array.isArray(value.payload) || Object.keys(value.payload).length) return close(peer, 1008, "No data protocol yet");
+        const frame = JSON.stringify({ type: "sync_request", sender: { userId: peer.actor, peerId: peer.peerId }, payload: {} });
+        const recipients = [...peers].filter((other) => other !== peer && other.id === peer.id && live(other));
+        if (!recipients.length) await deliver(peer);
+        for (const recipient of recipients) {
+          if (!live(peer)) break;
+          await deliver(peer, recipient, frame);
+        }
+      }
+    } catch { close(peer); }
+    finally { peer.busy = false; if (!live(peer)) { peer.queue.length = 0; peer.bytes = 0; } }
+  };
   realtime.on("wsClientError", (_error, socket) => rejectUpgrade(socket, 400));
   server.on("upgrade", (request, socket, head) => {
     const onError = () => socket.destroy();
@@ -68,9 +144,17 @@ export const attachRealtime = (server, { sessionMiddleware, pool, schema, trustP
       realtime.handleUpgrade(request, socket, head, (client) => {
         cleanup();
         socket.setTimeout(0);
-        client.on("error", () => client.terminate());
-        // T4a has no inbound protocol, relay, scene write or session renewal.
-        client.on("message", () => client.close(1008, "No data protocol yet"));
+        // Preserve ws protocol close codes (notably 1009) instead of destroying their close frame.
+        client.on("error", () => { if (client.readyState === 1) client.close(1008, "Transport error"); });
+        const peer = { socket: client, actor, sid: request.sessionID, id, peerId: randomUUID(), queue: [], bytes: 0, busy: false };
+        peers.add(peer);
+        client.once("close", () => { peers.delete(peer); peer.queue.length = 0; peer.bytes = 0; });
+        client.on("message", (data, binary) => {
+          if (!live(peer)) return;
+          if (peer.queue.length >= 8 || peer.bytes + data.length > limit) return close(peer, 1013, "Queue overloaded");
+          peer.queue.push({ data, binary }); peer.bytes += data.length;
+          if (!peer.busy) void drain(peer);
+        });
         client.send(JSON.stringify({ type: "ready", diagramId: id }));
       });
     };
