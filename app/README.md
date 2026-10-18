@@ -60,6 +60,15 @@ non-effects, identity-bound replacements, normalized creation races and distinct
 competition between the legacy and ID routes. Replacement callers supply known
 ETags explicitly; test helpers never fetch/retry the latest token automatically.
 
+Realtime session-baseline tests use the existing preload IPC to freeze only the
+child's `Date.now()`, including PgStore's ceiling-second comparisons. PostgreSQL
+`NOW()` and real deadline/transport timers remain real. A separate login alias
+holds the expiry-under-test SID; snapshot requests cannot roll it. SQL-result
+barriers establish frame completion, and observed session INSERT/UPDATE statements
+separate genuine HTTP rolling touch from read-only WS admission/relay. Stream
+capture exposes stdout/stderr separately while `logs()` preserves merged ordering.
+These baseline cases do not assert idle invalidation or establish runtime success.
+
 ## HTTP API
 
 The server exposes the session cookie `excalidraw.sid`; every route below except the

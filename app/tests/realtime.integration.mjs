@@ -512,3 +512,87 @@ test("file carriage preserves exact private binary records without persistence",
     a.send(value); await closed(a, 1009); b.send("unsupported"); await closed(b, 1008);
   }));
 });
+
+// Snapshot accounts keep their own login SIDs: public reads must never roll the
+// SID whose expiry is under test. Existing mutation cases above cover changed
+// stored identity, logout and deletion on the very next sender/recipient frame.
+for (const renewal of [false, true]) test(`session boundary: ${renewal ? "HTTP rolling renewal, never WS renewal" : "inclusive ceiling-second expiry"}`, { timeout: 60_000 }, async (t) => {
+  const f = await persistenceFixture(t, { realtime: true });
+  assert.equal((await f.request("/api/files/shared", "owner", "PUT", scene)).status, 200);
+  const id = (await f.request("/api/diagrams", "owner")).body.diagrams[0].id;
+  const route = `/api/diagrams/${id}`;
+  assert.equal((await f.request(`${route}/members`, "owner", "POST", { username: "member" })).status, 201);
+  await f.loginAs("probe", "member");
+  const sid = decodeURIComponent(f.cookieFor("probe").split("=")[1]).slice(2).split(".")[0];
+  const row = async () => (await f.setup(`SELECT sid, sess, EXTRACT(EPOCH FROM expire::timestamptz) AS expires
+    FROM fixture_schema.user_sessions WHERE sid=$1`, [sid])).rows[0];
+  // Only this isolated SID is shortened. DB NOW() is not a fake-time source.
+  const expiry = Math.ceil(Date.now() / 1000) + 120;
+  await f.setup("UPDATE fixture_schema.user_sessions SET expire=to_timestamp($1) WHERE sid=$2", [expiry, sid]);
+  const initial = await row();
+  const snapshot = async () => ({ documents: await f.snapshot(id, "shared"),
+    accounts: await f.request("/api/admin/users", "admin"), members: await f.request(`${route}/members`, "owner") });
+  const before = await snapshot();
+  const streams = f.streams();
+  assert.match(streams.stdout, /Excalidraw auth server listening/);
+  assert.equal(streams.stderr, "");
+  assert.equal(f.logs(), streams.stdout); // Known setup stdout is not an error.
+  const peers = [];
+  const open = async (user) => {
+    const peer = realtimePeer(id, f.cookieFor(user)); peers.push(peer);
+    const ready = await peer.next();
+    assert.deepEqual(ready, { type: "message", binary: false,
+      data: Buffer.from(JSON.stringify({ type: "ready", diagramId: id })) });
+    return peer;
+  };
+  try {
+    const observed = await f.realtimeObserve((expiry - 1) * 1000);
+    assert.equal(observed.now, (expiry - 1) * 1000);
+    const a = await open("probe"), b = await open("owner");
+    // Real relay completion is the oracle, not a quiet interval or timer expiry.
+    const gate = await f.realtimeGate();
+    const delivery = relay(a, b, f.users.member); delivery.catch(() => {});
+    try {
+      await gate.blocked;
+      const atBoundary = await f.realtimeObserve(expiry * 1000);
+      assert.equal(atBoundary.now, expiry * 1000);
+      gate.release(); await delivery;
+    } finally { gate.release(); }
+    assert.deepEqual(await row(), initial, "admission and relay preserve expiry and session payload");
+    assert.deepEqual((await f.realtimeObserve(expiry * 1000)).writes, observed.writes, "WS never saves or touches sessions");
+    if (renewal) {
+      const rolling = await f.request("/api/auth/session", "probe", "GET", undefined, {}, true);
+      assert.equal(rolling.status, 200);
+      assert.deepEqual(rolling.body, { authenticated: true, user: initial.sess.user });
+      assert.equal(rolling.cookie, f.cookieFor("probe"));
+      const { default: responseETag } = await import("etag");
+      assert.equal(rolling.etag, responseETag(JSON.stringify(rolling.body), { weak: true }));
+      assert.equal(rolling.warning, null);
+      const renewed = await row();
+      const nextExpiry = Math.ceil((expiry * 1000 + initial.sess.cookie.originalMaxAge) / 1000);
+      assert.equal(Number(renewed.expires), nextExpiry); assert.ok(nextExpiry > expiry);
+      assert.deepEqual(renewed.sess, initial.sess, "rolling touch does not rewrite stored payload");
+      const cookieExpiry = new Date(expiry * 1000 + initial.sess.cookie.originalMaxAge).toUTCString();
+      assert.equal(rolling.headers["set-cookie"], `${f.cookieFor("probe")}; Path=/; Expires=${cookieExpiry}; HttpOnly; SameSite=Lax`);
+      assert.deepEqual((await f.realtimeObserve(expiry * 1000 + 1)).writes, [...observed.writes, "UPDATE"]);
+      await relay(a, b, f.users.member, files, files); // Opaque bytes beyond the former expiry.
+      assert.deepEqual(await row(), renewed);
+      assert.deepEqual((await f.realtimeObserve(expiry * 1000 + 1)).writes, [...observed.writes, "UPDATE"]);
+      a.send("unsupported"); await closed(a, 1008, "No data protocol yet");
+    } else {
+      const nextBoundary = await f.realtimeObserve(expiry * 1000 + 1);
+      assert.equal(Math.ceil(nextBoundary.now / 1000), expiry + 1);
+      a.send(sync); await closed(a, 1008, "Access denied");
+      assert.deepEqual(await row(), initial);
+      assert.deepEqual((await f.realtimeObserve(expiry * 1000 + 1)).writes, observed.writes);
+    }
+    b.send("unsupported"); await closed(b, 1008, "No data protocol yet");
+  } finally {
+    await f.realtimeObserve();
+    try { await Promise.all(peers.map((peer) => peer.dispose())); }
+    finally {
+      assert.deepEqual(await snapshot(), before);
+      assert.equal(f.streams().stderr, "");
+    }
+  }
+});

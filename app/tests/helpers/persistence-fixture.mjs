@@ -27,6 +27,7 @@ export const persistenceFixture = async (t, { seedData, realtime = false } = {})
   });
   if (seedData) await seedData(directory);
   let output = "";
+  let stdout = "", stderr = "";
   server = spawn(process.execPath, ["--import", fileURLToPath(new URL("./storage-barrier.mjs", import.meta.url)),
     ...(realtime ? ["--import", fileURLToPath(new URL("./realtime-barrier.mjs", import.meta.url))] : []),
     fileURLToPath(new URL("../../server.mjs", import.meta.url))], {
@@ -36,8 +37,8 @@ export const persistenceFixture = async (t, { seedData, realtime = false } = {})
     stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
   closed = once(server, "close");
-  server.stdout.on("data", (chunk) => { output += chunk; });
-  server.stderr.on("data", (chunk) => { output += chunk; });
+  server.stdout.on("data", (chunk) => { output += chunk; stdout += chunk; });
+  server.stderr.on("data", (chunk) => { output += chunk; stderr += chunk; });
   for (let attempt = 0; attempt < 100 && !output.includes("Excalidraw auth server listening"); attempt++) {
     assert.equal(server.exitCode, null, output);
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -48,13 +49,14 @@ export const persistenceFixture = async (t, { seedData, realtime = false } = {})
   const users = {};
   const accounts = {};
   const backups = backupPaths(directory, accounts);
-  const request = async (route, user, method = "GET", body, headers = {}) => {
+  const request = async (route, user, method = "GET", body, headers = {}, captureHeaders = false) => {
     const response = await fetch(`http://127.0.0.1:3035${route}`, {
       method,
       headers: { "Content-Type": "application/json", ...(user ? { Cookie: cookies[user] } : {}), ...headers },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
-    return { status: response.status, body: await response.json(),
+    return { ...(captureHeaders ? { headers: Object.fromEntries(response.headers) } : {}),
+      status: response.status, body: await response.json(),
       etag: response.headers.get("etag"), warning: response.headers.get("x-backup-warning"), cookie: response.headers.get("set-cookie")?.split(";")[0] };
   };
   const hash = await bcrypt.hash("fixture-password", 4);
@@ -128,6 +130,17 @@ export const persistenceFixture = async (t, { seedData, realtime = false } = {})
     blocked.catch(() => {}); // Teardown cancellation is always consumed.
     return { blocked, release };
   };
+  const realtimeObserve = async (now = null) => {
+    assert.equal(realtime, true, "Realtime preload must be explicitly enabled");
+    const reply = (async () => {
+      for (;;) {
+        const [event] = await once(server, "message", { signal: AbortSignal.timeout(5000) });
+        if (event.realtime === "observed") return event;
+      }
+    })();
+    server.send({ realtime: "observe", now });
+    return reply;
+  };
   const blocked = async (count) => {
     const deadline = Date.now() + 5000;
     do {
@@ -166,5 +179,6 @@ export const persistenceFixture = async (t, { seedData, realtime = false } = {})
     accounts[alias] = login.body.user;
   };
   return { request, snapshot, setup, directory, users, storageBarrier, blocked, documentLock,
-    directoryLock, loginAs, backups, realtimeGate, cookieFor: (user) => cookies[user], logs: () => output };
+    directoryLock, loginAs, backups, realtimeGate, realtimeObserve,
+    cookieFor: (user) => cookies[user], logs: () => output, streams: () => ({ stdout, stderr }) };
 };
