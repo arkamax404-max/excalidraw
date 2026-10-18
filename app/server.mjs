@@ -473,20 +473,21 @@ app.delete("/api/admin/users/:id", requireAdmin, async (request, response, next)
     return;
   }
 
-  if (request.session.user.id === userId) {
-    response.status(400).json({ error: "No puedes eliminar tu propio usuario." });
-    return;
-  }
-
   let client;
   let lockKey;
   let destroy = false;
   try {
     client = await pool.connect();
-    const initial = (await client.query(`SELECT username FROM ${DB_SCHEMA}.users WHERE id = $1`,
+    const initial = (await client.query(`SELECT id, username FROM ${DB_SCHEMA}.users WHERE id = $1`,
       [userId])).rows[0];
     if (!initial) {
       response.status(404).json({ error: "El usuario solicitado no existe." });
+      return;
+    }
+    // Compare exact database identities: accepted numeric aliases (and rounding)
+    // may select a different target than the original route text suggests.
+    if (String(request.session.user.id) === String(initial.id)) {
+      response.status(400).json({ error: "No puedes eliminar tu propio usuario." });
       return;
     }
     // The physical directory survives account IDs. Exclude even a recreated

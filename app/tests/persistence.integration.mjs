@@ -564,6 +564,96 @@ test("directory identity survives username reuse while old owner cleanup is pend
     200, { members: [] });
 });
 
+test("admin self-deletion rejects the selected identity without public side effects", { timeout: 60_000 }, async (t) => {
+  for (const large of [false, true]) {
+    await t.test(large ? "rounded SQL target" : "ordinary ID and accepted numeric aliases", async (t) => {
+      const f = await persistenceFixture(t);
+      const { request } = f;
+      const adminId = large ? "9007199254740992" : f.users.admin;
+      if (large) {
+        await f.setup("UPDATE fixture_schema.users SET id = $1 WHERE username = 'admin'", [adminId]);
+        await f.loginAs("admin", "admin");
+      }
+      const created = await request("/api/files/admin-owned", "admin", "PUT", scene);
+      assert.equal(created.status, 200);
+      const id = created.etag.slice(1).split(":")[0];
+      const route = `/api/diagrams/${id}`;
+      assert.equal((await request(`${route}/members`, "admin", "POST", { username: "member" })).status, 201);
+      const publicState = async () => {
+        const state = { snapshot: await f.snapshot(id, "admin-owned") };
+        for (const user of ["admin", "member"]) {
+          for (const url of ["/api/auth/session", "/api/diagrams", "/api/files", route,
+            "/api/files/admin-owned", `${route}/members`]) {
+            state[`${user}:${url}`] = await request(url, user);
+          }
+        }
+        state.accounts = await request("/api/admin/users", "admin");
+        return state;
+      };
+      const before = await publicState();
+      assert.equal(before["admin:/api/auth/session"].body.user.id, adminId);
+      assert.equal(before.accounts.status, 200);
+      assert.equal(before.accounts.body.users.find((user) => user.id === adminId).diagramCount, 1);
+      assert.equal(before[`member:${route}`].etag, created.etag);
+      assert.deepEqual(before[`member:${route}`].body.scene, scene);
+      assert.equal(before.snapshot.backups["admin/admin-owned.excalidraw.json"],
+        `${JSON.stringify(scene, null, 2)}\n`);
+      const aliases = large ? [adminId, "9007199254740993"]
+        : [adminId, `0${adminId}`, `${adminId}.0`, `${adminId}e0`, `+${adminId}`,
+          `0x${Number(adminId).toString(16)}`];
+      for (const alias of aliases) {
+        expect(await request(`/api/admin/users/${alias}`, "admin", "DELETE"), 400,
+          { error: "No puedes eliminar tu propio usuario." });
+        assert.deepEqual(await publicState(), before, `self-DELETE ${alias} must have no effects`);
+      }
+      // Authentication and route validation retain their precedence over identity checks.
+      expect(await request(`/api/admin/users/${adminId}`, null, "DELETE"), 401,
+        { error: "Necesitas iniciar sesion." });
+      expect(await request(`/api/admin/users/${adminId}`, "member", "DELETE"), 403,
+        { error: "Necesitas permisos de administrador." });
+      for (const invalid of ["invalid", "0", "-1", "1.5"]) {
+        expect(await request(`/api/admin/users/${invalid}`, "admin", "DELETE"), 400,
+          { error: "El identificador de usuario no es valido." });
+      }
+      expect(await request("/api/admin/users/2147483647", "admin", "DELETE"), 404,
+        { error: "El usuario solicitado no existe." });
+      assert.deepEqual(await publicState(), before);
+
+      const owned = await request("/api/files/member-owned", "member", "PUT", scene);
+      assert.equal(owned.status, 200);
+      const memberRoute = `/api/diagrams/${owned.etag.slice(1).split(":")[0]}`;
+      assert.equal((await request(`${memberRoute}/members`, "member", "POST", { username: "owner" })).status, 201);
+      expect(await request(`/api/admin/users/${f.users.member}`, "admin", "DELETE"), 200,
+        { ok: true, user: { id: f.users.member, username: "member" } });
+      expect(await request(memberRoute, "owner"), 404, { error: "El diagrama solicitado no existe." });
+      expect(await request("/api/diagrams", "owner"), 200, { diagrams: [] });
+      expect(await request(`${route}/members`, "admin"), 200, { members: [] });
+      const after = await f.snapshot(id, "admin-owned");
+      assert.deepEqual(after.backups, before.snapshot.backups);
+      assert.deepEqual((await request(route, "admin")).body, before[`admin:${route}`].body);
+      assert.equal((await request(route, "admin")).etag, created.etag);
+    });
+  }
+});
+
+test("large adjacent admin identity does not block deletion of another selected user", { timeout: 60_000 }, async (t) => {
+  const f = await persistenceFixture(t);
+  const { request } = f;
+  // Provision exact adjacent IDs without changing or rewinding the fixture sequence.
+  await f.setup("UPDATE fixture_schema.users SET id = 9007199254740993 WHERE username = 'admin'");
+  await f.setup("UPDATE fixture_schema.users SET id = 9007199254740992 WHERE username = 'stranger'");
+  await f.loginAs("admin", "admin");
+  const session = await request("/api/auth/session", "admin");
+  assert.equal(session.body.user.id, "9007199254740993");
+  expect(await request("/api/admin/users/9007199254740992", "admin", "DELETE"), 200,
+    { ok: true, user: { id: "9007199254740992", username: "stranger" } });
+  assert.deepEqual(await request("/api/auth/session", "admin"), session);
+  const accounts = await request("/api/admin/users", "admin");
+  assert.equal(accounts.status, 200);
+  assert.ok(accounts.body.users.some((user) => user.id === "9007199254740993"));
+  assert.ok(!accounts.body.users.some((user) => user.id === "9007199254740992"));
+});
+
 test("owner SQL/cleanup faults retain existing contracts and release coordination", { timeout: 60_000 }, async (t) => {
   const f = await persistenceFixture(t);
   const { request } = f;

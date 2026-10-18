@@ -27,9 +27,12 @@ without copying unrelated document caches. Its three-case UI/HTTP browser proof 
 final lint passed. See [serialization scope](app/README.md#scene-serialization-repair-t3c2-candidate).
 Independent data/private-boundary verification passed for this repair; the earlier
 partial review remains historical. Already omitted data cannot be recovered by this fix.
-Scoped deletion coordination is verified. Pre-existing backup-directory collisions
-(e.g. `Foo`/`foo`) and administrator self-deletion remain unresolved; see
-[owner cleanup limits](app/README.md#ordered-owner-cleanup-t3d1-candidate).
+Scoped deletion coordination is verified. The administrator self-DELETE guard
+passed API regressions and scoped independent security verification; see
+[guard scope](app/README.md#administrator-self-deletion-guard-t3e0-candidate).
+Backup-directory collisions (e.g. `Foo`/`foo`) remain open, with storage cutover
+awaiting the D3 legacy-retention decision; no automatic backup migration/deletion.
+See [owner cleanup limits](app/README.md#ordered-owner-cleanup-t3d1-candidate).
 Realtime and collaboration UI remain unfinished; deployment is not authorized.
 
 ## Project structure

@@ -188,12 +188,23 @@ There is no filesystem crash-durability, repair queue, archive or cross-resource
 promise. Independent verification passed for this scoped coordination repair.
 **This candidate is not deployment approval.**
 
-Two pre-existing defects remain outside this repair. Accepted distinct usernames
-such as `Foo` and `foo` can map to the same backup directory; deleting one can
-remove the other's backups. Directory coordination does not establish universal
-cross-account backup isolation. Administrator self-deletion also currently returns
-200 because its identity comparison mixes string and numeric IDs. Neither behavior
-was changed; storage-layout or deletion-policy repairs require separate authorization.
+The pre-existing backup-directory collision remains open: accepted distinct usernames
+such as `Foo` and `foo` can map to the same directory; deleting one can remove the
+other's backups. Directory coordination does not establish universal cross-account
+backup isolation. Storage cutover awaits the D3 legacy-retention decision; existing
+backups are not automatically migrated or deleted by this repair.
+
+### Administrator self-deletion guard (T3e0 candidate)
+
+The DELETE guard now compares the session's exact ID with the actual selected
+PostgreSQL target ID before directory locking or deletion. Self-deletion returns
+HTTP 400 `{ error: "No puedes eliminar tu propio usuario." }`, including accepted
+numeric aliases and routes whose Number conversion rounds to the administrator.
+Nonself deletion, route validation and cascade/cleanup contracts are unchanged;
+the separate PUT self-deactivation guard is not part of this repair.
+The public HTTP regression was observed failing before this change. The corrected
+candidate passed all 79 API tests and scoped independent security verification.
+This is not deployment approval.
 
 ### Frontend guarded saves (T3c1 candidate)
 
@@ -245,9 +256,10 @@ and private-file boundaries.
 
 This repairs future saves only: it cannot recover binary files or deleted elements
 already omitted from stored scenes. T3c2's scoped persistence assurance is verified.
-Scoped T3d1 deletion coordination passed independent verification. The pre-existing
-backup-directory collision and administrator self-deletion defects above remain;
-realtime and collaboration UI are unfinished. Deployment is not authorized.
+Scoped T3d1 deletion coordination and the administrator self-deletion guard passed
+independent verification. The backup-directory collision still awaits the D3
+legacy-retention decision; realtime and collaboration UI are unfinished.
+Deployment is not authorized.
 
 ### Guarded stable-ID replacement (T3b)
 
