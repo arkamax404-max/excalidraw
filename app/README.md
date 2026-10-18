@@ -1,8 +1,8 @@
 # Application (frontend and server)
 
-**Backend-only intermediate — do not deploy yet.** Legacy replacements now require
-`If-Match`, but the existing UI does not send it until T3c1. No UI compatibility or
-browser verification is claimed here.
+**UI transition candidate — do not deploy yet.** Guarded-save browser checks
+passed. Independent review remains partial because the unchanged database
+serializer omits binary files and deleted elements (see below).
 
 The React frontend and the Express server of this self-hosted Excalidraw fork. See
 the repository root `README.md` for the deployment overview, the Compose workflow and
@@ -149,8 +149,35 @@ later creates; IDs are not gapless.
 
 Legacy backup-only failures now use the canonical-success warning described below,
 without changing the normal success JSON shape. GET/list/membership routes remain
-unchanged. Frontend adaptation awaits T3c1; deletion/owner-directory coordination
-awaits T3d. No cross-resource atomicity or crash durability is promised.
+unchanged. Deletion/owner-directory coordination awaits T3d.
+No cross-resource atomicity or crash durability is promised.
+
+### Frontend guarded saves (T3c1 candidate)
+
+Loading or saving captures the normalized name and exact strong ETag. `Guardar`
+uses that identity only for its matching name/account; changing to an unknown
+existing name never fetches its latest version to overwrite it. `Nuevo`, logout,
+account changes and deletion invalidate the applicable identity. Late responses
+cannot rename, load into, or assign versions to a different document context.
+
+On 412/428 the local drawing stays intact: choose another name and `Guardar` to
+preserve a copy, or select the server document in `Mis diagramas` to explicitly
+replace the local canvas. `Recargar` refreshes the list only. Other save errors
+also leave the canvas untouched. A backup warning means PostgreSQL **did save**;
+the new version is retained and the UI warns that the backup failed.
+
+`src/document-version.test.mjs` checks token admission, normalization, response
+contracts and stale acknowledgements without React internals. The installed
+Playwright CLI can run `tests/browser/document-save.mjs` with an explicit isolated
+fixture/config; it is not part of `npm test`. The isolated browser scenario passed
+after shortening Chromium's temporary socket path. It covers guarded saves and
+conflict retention, not binary-file or tombstone persistence.
+
+**Known pre-existing serialization limitation.** The frontend calls
+`serializeAsJSON(..., "database")`, which omits binary files and deleted elements.
+This call is unchanged by the guarded-save transition. The server preserves fields
+actually supplied by callers; passing files and deleted elements to this serializer
+does not include them in the request. Their persistence assurance remains unresolved.
 
 ### Guarded stable-ID replacement (T3b)
 

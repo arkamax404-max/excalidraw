@@ -10,6 +10,9 @@ import { excalidrawToMermaid } from "./mermaid/excalidrawToMermaid.js";
 import { toMermaidDownloadFilename } from "./mermaid/mermaidFilename.js";
 import { convertAndInsertMermaid } from "./ai/mermaidToScene.js";
 
+import { documentContext, renameDocument, beginDocumentOperation, documentHeaders,
+  acknowledgeDocument, readApiResponse, documentError, normalizeDocumentName } from "./document-version.mjs";
+
 const DEFAULT_FILE_NAME = "diagrama-1";
 const ADMIN_FORM_INITIAL_STATE = {
   id: null,
@@ -62,6 +65,10 @@ function App() {
   const [aiBusy, setAiBusy] = useState(false);
   const [aiError, setAiError] = useState("");
   const aiAbortController = useRef(null);
+  const documentVersion = useRef(documentContext(null, DEFAULT_FILE_NAME));
+  const resetDocumentIdentity = (account, name = DEFAULT_FILE_NAME) => {
+    documentVersion.current = documentContext(account, name, documentVersion.current);
+  };
 
   const currentFileName = useMemo(() => {
     const trimmedValue = fileName.trim();
@@ -71,6 +78,7 @@ function App() {
   const isAdmin = authUser?.isAdmin === true;
 
   const handleUnauthorized = useCallback((message = "Tu sesion ha expirado.") => {
+    resetDocumentIdentity(null);
     setAuthUser(null);
     setAvailableFiles([]);
     setFileName(DEFAULT_FILE_NAME);
@@ -82,7 +90,7 @@ function App() {
   }, []);
 
   const apiRequest = useCallback(
-    async (url, options = {}) => {
+    async (url, options = {}, metadata = false, operation) => {
       const headers = { ...(options.headers || {}) };
       if (options.body && !headers["Content-Type"]) {
         headers["Content-Type"] = "application/json";
@@ -93,22 +101,9 @@ function App() {
         ...options,
         headers,
       });
-      const payload = await parseApiResponse(response);
-
-      if (response.status === 401) {
-        handleUnauthorized(payload?.error || "Tu sesion ha expirado.");
-        const error = new Error(payload?.error || "Tu sesion ha expirado.");
-        error.status = 401;
-        throw error;
-      }
-
-      if (!response.ok) {
-        const error = new Error(payload?.error || "Se produjo un error inesperado.");
-        error.status = response.status;
-        throw error;
-      }
-
-      return payload;
+      return readApiResponse(response, (message) => {
+        if (!operation || documentVersion.current === operation) handleUnauthorized(message);
+      }, metadata);
     },
     [handleUnauthorized],
   );
@@ -158,6 +153,7 @@ function App() {
         const payload = await parseApiResponse(response);
 
         if (payload?.authenticated) {
+          resetDocumentIdentity(payload.user.id);
           setAuthUser(payload.user);
           setStatus(createStatus("success", `Sesion activa para ${payload.user.username}.`));
         }
@@ -195,6 +191,7 @@ function App() {
           body: JSON.stringify(authForm),
         });
 
+        resetDocumentIdentity(payload.user.id);
         setAuthUser(payload.user);
         setAuthForm({ username: "", password: "" });
         setAdminUsers([]);
@@ -211,10 +208,12 @@ function App() {
   );
 
   const logout = useCallback(async () => {
+    resetDocumentIdentity(documentVersion.current.account);
     setBusy(true);
 
     try {
       await apiRequest("/api/auth/logout", { method: "POST" });
+      resetDocumentIdentity(null);
       setAuthUser(null);
       setAvailableFiles([]);
       setFileName(DEFAULT_FILE_NAME);
@@ -237,6 +236,8 @@ function App() {
 
     setBusy(true);
     setStatus(createStatus("info", "Guardando diagrama..."));
+    const operation = beginDocumentOperation(documentVersion.current);
+    documentVersion.current = operation;
 
     try {
       const scene = serializeAsJSON(
@@ -246,21 +247,19 @@ function App() {
         "database",
       );
 
-      const payload = await apiRequest(
+      const result = await apiRequest(
         `/api/files/${encodeURIComponent(currentFileName)}`,
-        {
-          method: "PUT",
-          body: scene,
-        },
+        { method: "PUT", body: scene, headers: documentHeaders(operation) }, true, operation,
       );
-
-      setFileName(payload.file.name);
-      setStatus(
-        createStatus("success", `Guardado como ${payload.file.fileName}.`),
-      );
+      const next = acknowledgeDocument(documentVersion.current, operation, result);
+      if (!next) return;
+      documentVersion.current = next;
+      setFileName(next.name);
+      setStatus(createStatus(result.warning ? "info" : "success",
+        `Guardado como ${result.payload.file.fileName}.${result.warning ? " PostgreSQL confirmado; fallo el respaldo." : ""}${!next.identity ? " Falta la version: carga el diagrama antes de reemplazarlo." : ""}`));
       await refreshFiles();
     } catch (error) {
-      setStatus(createStatus("error", error.message));
+      if (documentVersion.current === operation) setStatus(createStatus("error", documentError(error)));
     } finally {
       setBusy(false);
     }
@@ -274,9 +273,16 @@ function App() {
 
       setBusy(true);
       setStatus(createStatus("info", `Cargando ${name}...`));
+      const previous = documentVersion.current;
+      const operation = beginDocumentOperation(renameDocument(previous, name));
+      documentVersion.current = operation;
 
       try {
-        const payload = await apiRequest(`/api/files/${encodeURIComponent(name)}`);
+        const result = await apiRequest(`/api/files/${encodeURIComponent(name)}`, {}, true, operation);
+        const next = acknowledgeDocument(documentVersion.current, operation, result);
+        if (!next) return;
+        documentVersion.current = next;
+        const payload = result.payload;
         const scene = payload.scene ?? {};
         const files = Object.values(scene.files ?? {});
 
@@ -294,7 +300,10 @@ function App() {
           createStatus("success", `${payload.file.fileName} cargado.`),
         );
       } catch (error) {
-        setStatus(createStatus("error", error.message));
+        if (documentVersion.current === operation) {
+          documentVersion.current = previous;
+          setStatus(createStatus("error", documentError(error)));
+        }
       } finally {
         setBusy(false);
       }
@@ -312,7 +321,12 @@ function App() {
           method: "DELETE",
         });
 
-        if (currentFileName === name) {
+        const current = documentVersion.current;
+        if (current.identity?.name === normalizeDocumentName(name)) {
+          resetDocumentIdentity(current.account, current.name);
+        }
+        if (normalizeDocumentName(current.name) === normalizeDocumentName(name)) {
+          resetDocumentIdentity(documentVersion.current.account);
           setFileName(DEFAULT_FILE_NAME);
         }
 
@@ -326,7 +340,7 @@ function App() {
         setBusy(false);
       }
     },
-    [apiRequest, currentFileName, refreshFiles],
+    [apiRequest, refreshFiles],
   );
 
   const createBlankDiagram = useCallback(() => {
@@ -334,6 +348,7 @@ function App() {
       return;
     }
 
+    resetDocumentIdentity(documentVersion.current.account);
     excalidrawAPI.resetScene();
     excalidrawAPI.history.clear();
     setFileName(DEFAULT_FILE_NAME);
@@ -718,7 +733,10 @@ function App() {
                 <input
                   id="fileName"
                   value={fileName}
-                  onChange={(event) => setFileName(event.target.value)}
+                  onChange={(event) => {
+                    documentVersion.current = renameDocument(documentVersion.current, event.target.value);
+                    setFileName(event.target.value);
+                  }}
                   placeholder={DEFAULT_FILE_NAME}
                   aria-label="Nombre del diagrama"
                 />

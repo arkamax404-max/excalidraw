@@ -15,6 +15,15 @@ This self-hosted deployment combines Excalidraw with:
 - authenticated prompt-to-diagram generation through OpenRouter with Groq fallback; and
 - a Docker image and Docker Compose configuration.
 
+## Guarded server saves
+
+The frontend preserves local drawings when a server replacement conflicts. Save
+under a different name to keep a copy, or explicitly load the server diagram;
+there is no automatic reload/retry. Backup-only warnings mean the PostgreSQL save
+succeeded. See [frontend save behavior](app/README.md#frontend-guarded-saves-t3c1-candidate).
+**Do not deploy this transition candidate while its serialization assurance remains
+unresolved.** Guarded-save browser checks have passed.
+
 ## Project structure
 
 - `app/`: React frontend, Express server, and Node.js package metadata
