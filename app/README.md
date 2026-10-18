@@ -59,9 +59,31 @@ authentication routes requires an authenticated session.
 | `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/session` | Session lifecycle |
 | `GET/POST/PUT/DELETE /api/admin/users` | User management; requires the account named exactly `admin` |
 | `GET /api/files`, `GET/PUT/DELETE /api/files/:name` | Per-user diagram storage; `PUT` takes the raw scene object |
+| `GET /api/diagrams`, `GET /api/diagrams/:id` | Owner-only stable-ID discovery and loading (contracts below) |
 | `POST /api/ai/diagram` | Prompt to Mermaid through OpenRouter with the Groq fallback chain |
 
 Diagram names are normalized server-side: NFKC, runs of characters outside
 `[\w\- ]` and whitespace runs become `-`, leading and trailing `[-_. ]` are stripped,
 the result is lowercased, truncated to 80 characters, and an empty result becomes
 `diagrama-1`.
+
+### Stable-ID reads
+
+`GET /api/diagrams` returns `{ diagrams: [...] }`, containing only the caller's
+own diagrams, ordered by `updatedAt` descending, then ID descending. Each item is
+`{ id, name, fileName, updatedAt }`; `id` is a decimal **string**, preserving the
+full PostgreSQL BIGINT range. An empty account receives `{ diagrams: [] }`.
+
+`GET /api/diagrams/:id` returns `{ diagram: { id, name, fileName, updatedAt }, scene }`.
+The scene is unchanged from the legacy load response. IDs must be canonical decimal
+integers from `1` through `9223372036854775807`; leading zeros, signs, whitespace,
+fractions and exponents are invalid. Invalid IDs return HTTP 400 with
+`{ error: "El identificador de diagrama no es valido." }`. Missing and other owners'
+IDs both return HTTP 404 with `{ error: "El diagrama solicitado no existe." }`.
+Both routes require a session (HTTP 401, `{ error: "Necesitas iniciar sesion." }`),
+even for malformed IDs. Being `admin` does not bypass ownership checks.
+
+These routes are read-only. Existing `/api/files` contracts and normalization are
+unchanged: overwrite retains the ID, while delete followed by recreation assigns
+a new ID. Memberships, sharing/revocation and shared saves are future slices;
+there is no sharing or ID-oriented write endpoint yet.

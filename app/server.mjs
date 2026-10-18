@@ -528,6 +528,52 @@ app.post("/api/ai/diagram", requireAuth, async (request, response) => {
   }
 });
 
+// IDs remain decimal strings: PostgreSQL BIGINT can exceed Number.MAX_SAFE_INTEGER.
+const getDiagramPayload = (row) => ({
+  id: row.id,
+  ...getDiagramFilePayload(row.name, row.updated_at.toISOString()),
+});
+
+app.get("/api/diagrams", requireAuth, async (request, response, next) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, updated_at
+       FROM ${DB_SCHEMA}.diagrams
+       WHERE user_id = $1
+       ORDER BY updated_at DESC, id DESC`,
+      [request.session.user.id],
+    );
+    response.json({ diagrams: result.rows.map(getDiagramPayload) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/diagrams/:id", requireAuth, async (request, response, next) => {
+  const id = request.params.id;
+  if (!/^[1-9][0-9]{0,18}$/.test(id) || BigInt(id) > 9223372036854775807n) {
+    response.status(400).json({ error: "El identificador de diagrama no es valido." });
+    return;
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT id, name, scene_json, updated_at
+       FROM ${DB_SCHEMA}.diagrams
+       WHERE id = $1 AND user_id = $2`,
+      [id, request.session.user.id],
+    );
+    const diagram = result.rows[0];
+    if (!diagram) {
+      response.status(404).json({ error: "El diagrama solicitado no existe." });
+      return;
+    }
+    response.json({ diagram: getDiagramPayload(diagram), scene: diagram.scene_json });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/files", requireAuth, async (request, response, next) => {
   try {
     const result = await pool.query(
