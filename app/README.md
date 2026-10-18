@@ -80,7 +80,7 @@ Diagram names are normalized server-side: NFKC, runs of characters outside
 the result is lowercased, truncated to 80 characters, and an empty result becomes
 `diagrama-1`.
 
-### Realtime transport (T4a/T4b1a)
+### Realtime transport (T4a/T4b1a/T4b1b)
 
 Connect to `ws(s)://<same-host>/api/realtime/diagrams/:id` with the existing signed
 `excalidraw.sid` login cookie and an explicit same-origin HTTP(S) `Origin` header.
@@ -96,13 +96,16 @@ body: 401 for missing/invalid sessions or inactive actors, 400 for invalid IDs,
 or mismatched Origin. Internal failures return an empty 500; malformed WebSocket
 handshakes return an empty 400. Origin is checked before session and room access.
 
-Clients may send exactly `{"type":"sync_request","payload":{}}`. Other peers in the
+Clients may send exactly `{"type":"sync_request","payload":{}}` or
+`{"type":"scene","payload":{"elements":[...]}}`. Other peers in the
 same room receive that type/payload plus `sender:{userId,peerId}`: the exact account ID
 and a server-generated per-connection identity. There is no echo or cross-room delivery.
 Unknown fields/kinds, malformed/scalar JSON and binary data close with 1008
-(`No data protocol yet`). Scene, pointer and file messages remain unsupported.
+(`No data protocol yet`). Pointer and file messages remain unsupported.
+Scene records validate element identities, versions/nonces and deletion/updated metadata;
+optional index/fileId are string-or-null. Extensions, tombstones and order are preserved.
 Compression is disabled. Input (including fragmented messages) and encoded output are
-capped at 25 MiB; oversize input closes with 1009. Each sender has at most eight pending
+capped at 25 MiB; oversize input or encoded output closes with 1009. Each sender has at most eight pending
 messages/25 MiB, excluding in-flight work. Queue overflow or recipient buffered output
 plus a frame exceeding 25 MiB closes the affected connection with 1013.
 Every delivery freshly locks both sessions, active actors/owner, room and memberships

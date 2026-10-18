@@ -2,7 +2,7 @@ import WebSocket from "ws";
 import { realtimeOrigin } from "./realtime-client.mjs";
 
 // One bounded event queue, including terminal events; no background promise chain.
-export const realtimePeer = (id, cookie, { compression = false } = {}) => {
+export const realtimePeer = (id, cookie, { compression = false, maxFrameBytes = 65536 } = {}) => {
   const socket = new WebSocket(`${realtimeOrigin.replace("http:", "ws:")}/api/realtime/diagrams/${id}`, {
     headers: { Cookie: cookie, Origin: realtimeOrigin },
     perMessageDeflate: compression, handshakeTimeout: 2000,
@@ -14,7 +14,7 @@ export const realtimePeer = (id, cookie, { compression = false } = {}) => {
   let finishClose;
   const push = (event) => {
     if (disposed) return;
-    if (queue.length >= 8 || (event.data?.length ?? 0) > 65536) {
+    if (queue.length >= 8 || (event.data?.length ?? 0) > maxFrameBytes) {
       queue.length = 0;
       event = { type: "error", error: new Error("Realtime peer queue limit") };
       socket.terminate();

@@ -7,19 +7,19 @@ import { realtimePeer } from "./helpers/realtime-peer.mjs";
 const sync = { type: "sync_request", payload: {} };
 const limit = 25 * 1024 * 1024;
 const identities = new WeakMap();
-const relay = async (sender, recipient, userId, value = sync) => {
+const relay = async (sender, recipient, userId, value = sync, expected = sync) => {
   try {
     const received = Promise.race([sender.next(false).then((event) => ({ ...event, echo: true })), recipient.next()]);
     if (typeof value === "function") value(); else sender.send(value);
     const event = await received;
-    assert.equal(event.type, "message", `expected relay, got ${JSON.stringify(event)}`);
+    assert.equal(event.type, "message", `expected relay, got ${JSON.stringify({ ...event, data: event.data?.length })}`);
     assert.equal(event.echo, undefined, "no sender echo");
     assert.equal(event.binary, false);
     const frame = JSON.parse(event.data.toString("utf8"));
     assert.equal(typeof frame.sender?.peerId, "string");
     assert.ok(frame.sender.peerId.length > 0);
     const peerId = identities.get(sender) ?? frame.sender.peerId;
-    assert.deepEqual(frame, { ...sync, sender: { userId: String(userId), peerId } });
+    assert.deepEqual(frame, { ...expected, sender: { userId: String(userId), peerId } });
     identities.set(sender, peerId);
   } finally { sender.cancelRead(); recipient.cancelRead(); }
 };
@@ -29,7 +29,7 @@ const closed = async (peer, code, reason) => {
   assert.equal(event.code, code);
   if (reason) assert.equal(event.reason, reason);
 };
-const syncFixture = async (t, body) => {
+const syncFixture = async (t, body, peerOptions = {}) => {
   const f = await persistenceFixture(t, { realtime: true });
   for (const user of ["owner", "stranger"]) assert.equal((await f.request("/api/files/shared", user, "PUT", scene)).status, 200);
   const id = (await f.request("/api/diagrams", "owner")).body.diagrams[0].id;
@@ -42,7 +42,7 @@ const syncFixture = async (t, body) => {
   let expected = await snapshot();
   const peers = [];
   const open = async (user, room = id) => {
-    const peer = realtimePeer(room, f.cookieFor(user), { compression: true });
+    const peer = realtimePeer(room, f.cookieFor(user), { compression: true, ...peerOptions });
     peers.push(peer);
     const ready = await peer.next();
     assert.equal(ready.type, "message"); assert.equal(ready.binary, false);
@@ -268,5 +268,68 @@ test("sync_request has a current private bounded delivery gate", { timeout: 240_
       else { b.send("unsupported"); await closed(b, 1008); }
       if (mode === "eight pending" || mode === "outbound pressure") { a.send("unsupported"); await closed(a, 1008); }
     } finally { gate.release(); }
+  }));
+});
+
+const atom = { id: "live", version: 1, versionNonce: Number.MIN_SAFE_INTEGER, isDeleted: false, updated: 0 };
+const scenePacket = (elements) => ({ type: "scene", payload: { elements } });
+const richScene = scenePacket([{ ...atom, index: null, fileId: "image", updatedAt: "literal-é", extension: { createdAt: "unchanged", items: [null, true, 3] } },
+  { ...atom, id: "tombstone", version: Number.MAX_SAFE_INTEGER, versionNonce: Number.MAX_SAFE_INTEGER, isDeleted: true, updated: Number.MAX_VALUE, index: "a1", fileId: null }]);
+const sceneFixture = (t, body) => syncFixture(t, async (context) => {
+  await relay(context.a, context.b, context.f.users.owner, richScene, richScene); // Fast close1008 RED before any scene barrier.
+  await body(context);
+}, { maxFrameBytes: limit });
+
+test("scene carriage preserves private ordered JSON without persistence", { timeout: 240_000 }, async (t) => {
+  await t.test("owner/member identity, tombstones/extensions, empty arrays, no echo or cross-room frames", (t) => sceneFixture(t, async ({ f, a, b, c, d }) => {
+    await relay(b, a, f.users.member, richScene, richScene);
+    const empty = scenePacket([]); await relay(a, b, f.users.owner, empty, empty);
+    for (const peer of [a, b, c, d]) { peer.send("unsupported"); await closed(peer, 1008, "No data protocol yet"); }
+  }));
+  const records = [null, [], 1, "x", ...Object.keys(atom).map((key) => Object.fromEntries(Object.entries(atom).filter(([name]) => name !== key))),
+    ...[["id", ["", 1]], ["version", [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, "1", null]],
+      ["versionNonce", [1.5, Number.MIN_SAFE_INTEGER - 1, Number.MAX_SAFE_INTEGER + 1, "1", null]],
+      ["isDeleted", [0, "false", null]], ["updated", [-1, "0", null]], ["index", [1]], ["fileId", [1]]]
+      .flatMap(([key, values]) => values.map((value) => ({ ...atom, [key]: value })))];
+  const extras = ["appState", "files", "sender", "room", "session", "target", "ETag", "revision"];
+  const invalid = [...records.map((record) => scenePacket([record])), ...[null, {}, 1, "x"].map(scenePacket),
+    ...[null, [], 1, {}].map((payload) => ({ type: "scene", payload })),
+    ...extras.flatMap((key) => [{ ...richScene, [key]: "forged" }, { ...richScene, payload: { ...richScene.payload, [key]: "forged" } }]),
+    JSON.stringify(richScene).replace('"updated":0', '"updated":1e309')];
+  for (const [index, value] of invalid.entries()) await t.test(`scene shape/field rejection ${index}`, (t) => sceneFixture(t, async ({ a, b }) => {
+    a.send(value); await closed(a, 1008, "No data protocol yet"); b.send("unsupported"); await closed(b, 1008);
+  }));
+  await t.test("quick distinguishable scenes retain per-sender order", (t) => sceneFixture(t, async ({ f, a, b }) => {
+    const frames = [2, 3, 4].map((version) => scenePacket([{ ...atom, version }]));
+    for (const frame of frames) a.send(frame);
+    for (const frame of frames) { const event = await b.next(); assert.equal(event.type, "message"); assert.deepEqual(JSON.parse(event.data), { ...frame, sender: { userId: String(f.users.owner), peerId: identities.get(a) } }); }
+    a.send("unsupported"); await closed(a, 1008); b.send("unsupported"); await closed(b, 1008);
+  }));
+  await t.test("scene enqueue locks revocation, then excludes stale recipient/sender while valid delivery continues", (t) => sceneFixture(t, async ({ f, a, b, route, open, checkpoint }) => {
+    const gate = await f.realtimeGate();
+    try {
+      a.send(richScene); await gate.blocked;
+      const revoking = f.request(`${route}/members/member`, "owner", "DELETE"); revoking.catch(() => {});
+      await f.blocked(1); gate.release();
+      const event = await b.next(); assert.equal(event.type, "message"); assert.deepEqual(JSON.parse(event.data), { ...richScene, sender: { userId: String(f.users.owner), peerId: identities.get(a) } });
+      assert.equal((await revoking).status, 200); await checkpoint();
+      const valid = await open("owner"); await relay(a, valid, f.users.owner, richScene, richScene);
+      if (b.open) b.send(richScene); await closed(b, 1008);
+      for (const peer of [a, valid]) { peer.send("unsupported"); await closed(peer, 1008); }
+    } finally { gate.release(); }
+  }));
+  await t.test("encoded output exactly25MiB passes; one extra UTF-8 byte below input cap closes1009", (t) => sceneFixture(t, async ({ f, a, b }) => {
+    const value = structuredClone(richScene); value.payload.elements[0].padding = "";
+    const encoded = () => JSON.stringify({ ...value, sender: { userId: String(f.users.owner), peerId: identities.get(a) } });
+    const remaining = limit - Buffer.byteLength(encoded()); value.payload.elements[0].padding = "é".repeat(Math.floor(remaining / 2)) + "x".repeat(remaining % 2);
+    assert.equal(Buffer.byteLength(encoded()), limit); await relay(a, b, f.users.owner, value, value);
+    value.payload.elements[0].padding += "x"; assert.equal(Buffer.byteLength(encoded()), limit + 1); assert.ok(Buffer.byteLength(JSON.stringify(value)) < limit);
+    a.send(value); await closed(a, 1009); b.send("unsupported"); await closed(b, 1008);
+  }));
+  for (const fragmented of [false, true]) await t.test(`scene raw UTF-8 input25MiB/+1, fragmented=${fragmented}`, (t) => sceneFixture(t, async ({ f, a, b }) => {
+    let raw = JSON.stringify(richScene); raw = raw.padEnd(raw.length + limit - Buffer.byteLength(raw), " "); assert.equal(Buffer.byteLength(raw), limit);
+    const send = (text) => fragmented ? (a.send(text.slice(0, limit / 2), { fin: false }), a.send(text.slice(limit / 2), { fin: true })) : a.send(text);
+    await relay(a, b, f.users.owner, () => send(raw), richScene);
+    send(raw + " "); await closed(a, 1009); b.send("unsupported"); await closed(b, 1008);
   }));
 });

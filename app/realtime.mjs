@@ -5,6 +5,14 @@ import { WebSocketServer } from "ws";
 const canonicalId = (id) => typeof id === "string" &&
   /^[1-9][0-9]{0,18}$/.test(id) && BigInt(id) <= 9223372036854775807n;
 
+const validElement = (element) => element !== null && typeof element === "object" && !Array.isArray(element) &&
+  typeof element.id === "string" && element.id.length > 0 &&
+  Number.isSafeInteger(element.version) && element.version > 0 &&
+  Number.isSafeInteger(element.versionNonce) && typeof element.isDeleted === "boolean" &&
+  Number.isFinite(element.updated) && element.updated >= 0 &&
+  ["index", "fileId"].every((key) => !Object.hasOwn(element, key) ||
+    element[key] === null || typeof element[key] === "string");
+
 const sameOrigin = (request, trustProxy) => {
   const origin = request.headers.origin;
   const host = request.headers.host;
@@ -93,9 +101,12 @@ export const attachRealtime = (server, { sessionMiddleware, pool, schema, sessio
         let value;
         try { value = JSON.parse(data.toString("utf8")); } catch { /* Reject through the same policy below. */ }
         if (binary || !value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length !== 2 ||
-            value.type !== "sync_request" || !value.payload || typeof value.payload !== "object" ||
-            Array.isArray(value.payload) || Object.keys(value.payload).length) return close(peer, 1008, "No data protocol yet");
-        const frame = JSON.stringify({ type: "sync_request", sender: { userId: peer.actor, peerId: peer.peerId }, payload: {} });
+            !value.payload || typeof value.payload !== "object" || Array.isArray(value.payload) ||
+            !(value.type === "sync_request" ? Object.keys(value.payload).length === 0 :
+              value.type === "scene" && Object.keys(value.payload).length === 1 &&
+              Array.isArray(value.payload.elements) && value.payload.elements.every(validElement))) return close(peer, 1008, "No data protocol yet");
+        const frame = JSON.stringify({ type: value.type, sender: { userId: peer.actor, peerId: peer.peerId }, payload: value.payload });
+        if (Buffer.byteLength(frame) > limit) return close(peer, 1009, "Message too large");
         const recipients = [...peers].filter((other) => other !== peer && other.id === peer.id && live(other));
         if (!recipients.length) await deliver(peer);
         for (const recipient of recipients) {
