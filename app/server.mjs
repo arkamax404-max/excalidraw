@@ -143,6 +143,17 @@ const bootstrapDatabase = async () => {
       )
     `);
     await client.query(`
+      CREATE TABLE IF NOT EXISTS ${DB_SCHEMA}.diagram_members (
+        diagram_id BIGINT NOT NULL REFERENCES ${DB_SCHEMA}.diagrams(id) ON DELETE CASCADE,
+        user_id BIGINT NOT NULL REFERENCES ${DB_SCHEMA}.users(id) ON DELETE CASCADE,
+        PRIMARY KEY (diagram_id, user_id)
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS diagram_members_user_idx
+      ON ${DB_SCHEMA}.diagram_members (user_id)
+    `);
+    await client.query(`
       CREATE INDEX IF NOT EXISTS diagrams_user_updated_idx
       ON ${DB_SCHEMA}.diagrams (user_id, updated_at DESC)
     `);
@@ -534,12 +545,20 @@ const getDiagramPayload = (row) => ({
   ...getDiagramFilePayload(row.name, row.updated_at.toISOString()),
 });
 
+const isValidDiagramId = (id) =>
+  /^[1-9][0-9]{0,18}$/.test(id) && BigInt(id) <= 9223372036854775807n;
+const memberAccess = `EXISTS (
+  SELECT 1 FROM ${DB_SCHEMA}.diagram_members AS membership
+  JOIN ${DB_SCHEMA}.users AS member ON member.id = membership.user_id AND member.is_active
+  WHERE membership.diagram_id = diagrams.id AND membership.user_id = $1
+)`;
+
 app.get("/api/diagrams", requireAuth, async (request, response, next) => {
   try {
     const result = await pool.query(
       `SELECT id, name, updated_at
        FROM ${DB_SCHEMA}.diagrams
-       WHERE user_id = $1
+       WHERE user_id = $1 OR ${memberAccess}
        ORDER BY updated_at DESC, id DESC`,
       [request.session.user.id],
     );
@@ -551,7 +570,7 @@ app.get("/api/diagrams", requireAuth, async (request, response, next) => {
 
 app.get("/api/diagrams/:id", requireAuth, async (request, response, next) => {
   const id = request.params.id;
-  if (!/^[1-9][0-9]{0,18}$/.test(id) || BigInt(id) > 9223372036854775807n) {
+  if (!isValidDiagramId(id)) {
     response.status(400).json({ error: "El identificador de diagrama no es valido." });
     return;
   }
@@ -560,8 +579,8 @@ app.get("/api/diagrams/:id", requireAuth, async (request, response, next) => {
     const result = await pool.query(
       `SELECT id, name, scene_json, updated_at
        FROM ${DB_SCHEMA}.diagrams
-       WHERE id = $1 AND user_id = $2`,
-      [id, request.session.user.id],
+       WHERE id = $2 AND (user_id = $1 OR ${memberAccess})`,
+      [request.session.user.id, id],
     );
     const diagram = result.rows[0];
     if (!diagram) {
@@ -573,6 +592,83 @@ app.get("/api/diagrams/:id", requireAuth, async (request, response, next) => {
     next(error);
   }
 });
+
+const requireDiagramOwner = async (request, response, next) => {
+  if (!isValidDiagramId(request.params.id)) {
+    response.status(400).json({ error: "El identificador de diagrama no es valido." });
+    return;
+  }
+  try {
+    const result = await pool.query(
+      `SELECT user_id FROM ${DB_SCHEMA}.diagrams WHERE id = $1`, [request.params.id],
+    );
+    if (!result.rows[0]) {
+      response.status(404).json({ error: "El diagrama solicitado no existe." });
+    } else if (result.rows[0].user_id !== request.session.user.id) {
+      response.status(403).json({ error: "Necesitas ser propietario del diagrama." });
+    } else {
+      next();
+    }
+  } catch (error) { next(error); }
+};
+
+app.get("/api/diagrams/:id/members", requireAuth, requireDiagramOwner, async (request, response, next) => {
+  try {
+    const result = await pool.query(
+      `SELECT users.id, users.username, users.display_name
+       FROM ${DB_SCHEMA}.diagram_members AS membership
+       JOIN ${DB_SCHEMA}.users AS users ON users.id = membership.user_id
+       WHERE membership.diagram_id = $1 ORDER BY users.username ASC`, [request.params.id],
+    );
+    response.json({ members: result.rows.map(createSessionUser) });
+  } catch (error) { next(error); }
+});
+
+const changeMembership = async (request, response, next) => {
+  const raw = request.method === "POST" ? request.body?.username : request.params.username;
+  const username = sanitizeUsername(raw);
+  if (typeof raw !== "string" || !/^[A-Za-z0-9._-]{3,50}$/.test(username)) {
+    response.status(400).json({ error: "El usuario no es valido." });
+    return;
+  }
+  try {
+    const result = await pool.query(
+      `SELECT id, username, display_name, is_active FROM ${DB_SCHEMA}.users WHERE username = $1`, [username],
+    );
+    const user = result.rows[0];
+    if (user?.id === request.session.user.id) {
+      response.status(400).json({ error: "El propietario no puede ser miembro." });
+      return;
+    }
+    if (request.method === "POST") {
+      if (!user?.is_active) {
+        response.status(404).json({ error: "El usuario activo solicitado no existe." });
+        return;
+      }
+      const added = await pool.query(
+        `INSERT INTO ${DB_SCHEMA}.diagram_members (diagram_id, user_id)
+         VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING user_id`, [request.params.id, user.id],
+      );
+      if (!added.rowCount) {
+        response.status(409).json({ error: "Ese usuario ya es miembro." });
+        return;
+      }
+      response.status(201).json({ ok: true, member: createSessionUser(user) });
+    } else {
+      const removed = await pool.query(
+        `DELETE FROM ${DB_SCHEMA}.diagram_members WHERE diagram_id = $1 AND user_id = $2`,
+        [request.params.id, user?.id ?? null],
+      );
+      if (!removed.rowCount) {
+        response.status(404).json({ error: "La membresia solicitada no existe." });
+        return;
+      }
+      response.json({ ok: true });
+    }
+  } catch (error) { next(error); }
+};
+app.post("/api/diagrams/:id/members", requireAuth, requireDiagramOwner, changeMembership);
+app.delete("/api/diagrams/:id/members/:username", requireAuth, requireDiagramOwner, changeMembership);
 
 app.get("/api/files", requireAuth, async (request, response, next) => {
   try {
