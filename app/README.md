@@ -171,15 +171,15 @@ SQL/cleanup failures and subsequent operation.
 ### Ordered owner cleanup (T3d1 candidate)
 
 Both save routes and diagram DELETE acquire a shared PostgreSQL session lock on the
-actual normalized owner-directory path **before** their document lock. Owner-account
+actual account-ID owner-directory path **before** their document lock. Owner-account
 DELETE takes that directory exclusively through the canonical cascade and recursive
 cleanup. Different directories and ordinary different-document operations can proceed
 independently. Member saves use the stored owner's directory, not the member's.
 
-Directory identity does not depend on account ID: a newly recreated username's saves
-wait for old cleanup to finish. Waiting old sessions/diagram IDs are revalidated and
-cannot recreate deleted ownership or inherit membership. Account creation/reuse policy
-and directory/name normalization are unchanged.
+Directory identity now uses the stored account ID: a recreated username's new account
+can save independently while old-ID cleanup is pending. Waiting old sessions/diagram
+IDs are revalidated and cannot recreate deleted ownership or inherit membership.
+Account creation/reuse policy and document-name normalization are unchanged.
 
 Owner DELETE still commits its cascade before cleanup. Cleanup failure returns the
 existing generic HTTP 500, with the account/shared diagrams already deleted and
@@ -188,11 +188,22 @@ There is no filesystem crash-durability, repair queue, archive or cross-resource
 promise. Independent verification passed for this scoped coordination repair.
 **This candidate is not deployment approval.**
 
-The pre-existing backup-directory collision remains open: accepted distinct usernames
-such as `Foo` and `foo` can map to the same directory; deleting one can remove the
-other's backups. Directory coordination does not establish universal cross-account
-backup isolation. Storage cutover awaits the D3 legacy-retention decision; existing
-backups are not automatically migrated or deleted by this repair.
+### Forward-only account-ID backups (T3e1b candidate)
+
+New backup operations use `DATA_DIR/.owners-v1/<stored-account-ID>/<normalized-name>.excalidraw.json`.
+Member saves use the stored owner's exact ID, not the actor's ID or a normalized username.
+The hidden namespace is created lazily on backup writes; backup tooling must include
+hidden entries. A regular file obstructing its root is not removed or repaired:
+PostgreSQL saves still succeed with the backup warning described below.
+
+All legacy username folders remain untouched, including after diagram/account deletion.
+Startup and application loads remain SQL-only: no legacy scan, automatic restoration,
+import, adoption, copy, move or deletion occurs. Historical mixed ownership is **not
+repaired or inferred**. Any future migration or disposal needs separate consent.
+Cleanup failure may leave an old-ID backup; recreating a username does not adopt it.
+Namespace verification passed: 83 API tests, 43 unit tests, lint, build and 94 public
+differential pairs, plus scoped independent data/security/concurrency verification.
+This candidate is not deployment approval.
 
 ### Administrator self-deletion guard (T3e0 candidate)
 
@@ -257,9 +268,9 @@ and private-file boundaries.
 This repairs future saves only: it cannot recover binary files or deleted elements
 already omitted from stored scenes. T3c2's scoped persistence assurance is verified.
 Scoped T3d1 deletion coordination and the administrator self-deletion guard passed
-independent verification. The backup-directory collision still requires the
-account-ID namespace implementation. The D3 frozen-legacy policy is approved,
-but the cutover, realtime and collaboration UI are unfinished.
+independent verification. The account-ID namespace cutover passed functional and
+scoped independent verification. Legacy folders remain frozen under the approved D3
+policy; realtime and collaboration UI are unfinished.
 Deployment is not authorized.
 
 ### Guarded stable-ID replacement (T3b)
@@ -294,7 +305,7 @@ row, and performs a transactional CAS. Authorization linearizes at the UPDATE's
 READ COMMITTED snapshot: a later revocation need not cancel an already authorized
 save. Membership mutation code is unchanged. The session lock remains held through
 commit and awaited backup completion, ordering participating guarded backups; the
-backup username/name come from the stored owner join, never the acting member.
+backup account ID/name come from the stored owner join, never the acting member.
 Rollback/error paths release the session; failed rollback/unlock destroys it.
 
 If only backup writing fails after commit, return canonical success and the new

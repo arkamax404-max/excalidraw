@@ -1,11 +1,12 @@
 import path from "node:path";
 
-// Fixture owners carry both identities; the current backup layout uses username.
+// Keep test path expectations independent from production's derivation.
 export const backupPaths = (root, owners) => {
   const relative = (owner, name) => {
     const account = typeof owner === "string" ? owners[owner] : owner;
-    return name === undefined ? account.username
-      : path.join(account.username, `${name}.excalidraw.json`);
+    const directory = path.join(".owners-v1", account.id);
+    return name === undefined ? directory
+      : path.join(directory, `${name}.excalidraw.json`);
   };
   return {
     relative,

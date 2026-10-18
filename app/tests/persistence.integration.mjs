@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdir, unlink } from "node:fs/promises";
+import { mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { persistenceFixture } from "./helpers/persistence-fixture.mjs";
 
@@ -10,6 +10,182 @@ const expect = (result, status, body) => {
   assert.equal(result.status, status);
   assert.deepEqual(result.body, body);
 };
+
+test("case-distinct accounts keep same-name scenes in account-ID backups", { timeout: 60_000 }, async (t) => {
+  const { request, loginAs, directory } = await persistenceFixture(t);
+  const accounts = [];
+  for (const username of ["Foo", "foo"]) {
+    const provisioned = await request("/api/admin/users", "admin", "POST",
+      { username, password: "fixture-password" });
+    assert.equal(provisioned.status, 201);
+    const accountId = provisioned.body.user.id;
+    assert.equal(typeof accountId, "string");
+    assert.match(accountId, /^[1-9][0-9]*$/);
+    await loginAs(username, username);
+    const session = await request("/api/auth/session", username);
+    assert.equal(session.status, 200);
+    assert.equal(session.body.user.id, accountId);
+    const content = { ...scene, elements: [{ id: `private-${username}` }] };
+    const saved = await request("/api/files/Same Name!!", username, "PUT", content);
+    assert.equal(saved.status, 200);
+    assert.equal(saved.warning, null);
+    assert.equal(saved.body.file.name, "same-name");
+    const id = saved.etag.slice(1).split(":")[0];
+    accounts.push({ username, accountId, content, saved, id });
+  }
+  assert.notEqual(accounts[0].accountId, accounts[1].accountId);
+  assert.notEqual(accounts[0].id, accounts[1].id);
+  for (const { username, accountId, content, saved, id } of accounts) {
+    const metadata = { id, revision: "1", ...saved.body.file };
+    const loaded = await request(`/api/diagrams/${id}`, username);
+    expect(loaded, 200, { diagram: metadata, scene: content });
+    assert.equal(loaded.etag, saved.etag);
+    expect(await request("/api/files/same-name", username), 200,
+      { file: saved.body.file, scene: content });
+    expect(await request("/api/diagrams", username), 200, { diagrams: [metadata] });
+    expect(await request("/api/files", username), 200, { files: [saved.body.file] });
+    const other = accounts.find((account) => account.username !== username);
+    assert.equal((await request(`/api/diagrams/${id}`, other.username)).status, 404);
+    const backup = path.join(directory, ".owners-v1", accountId, "same-name.excalidraw.json");
+    assert.equal(await readFile(backup, "utf8"), `${JSON.stringify(content, null, 2)}\n`);
+    assert.deepEqual(await readdir(path.dirname(backup)), ["same-name.excalidraw.json"]);
+  }
+  assert.deepEqual((await readdir(path.join(directory, ".owners-v1"))).sort(),
+    accounts.map(({ accountId }) => accountId).sort());
+});
+
+test("legacy username backups stay frozen through saves and diagram/account deletion", { timeout: 60_000 }, async (t) => {
+  const legacyScene = { elements: [{ id: "historical-only" }] };
+  const seeded = {
+    "owner/frozen.excalidraw.json": Buffer.from(`${JSON.stringify(legacyScene)}\n`),
+    "owner/legacy-only.excalidraw.json": Buffer.from(`${JSON.stringify(legacyScene)}\n`),
+    "owner/nested/sentinel.bin": Buffer.from([0, 255, 17, 10]),
+    "former-user/sentinel.txt": Buffer.from("historically ambiguous: leave intact\n"),
+  };
+  const { request, directory } = await persistenceFixture(t, { seedData: async (root) => {
+    for (const [relative, bytes] of Object.entries(seeded)) {
+      await mkdir(path.dirname(path.join(root, relative)), { recursive: true });
+      await writeFile(path.join(root, relative), bytes);
+    }
+  } });
+  const legacyState = async () => {
+    const state = {};
+    for (const folder of ["owner", "former-user"]) {
+      state[folder] = (await readdir(path.join(directory, folder), { recursive: true })).sort();
+    }
+    for (const relative of Object.keys(seeded)) state[relative] = await readFile(path.join(directory, relative));
+    return state;
+  };
+  const before = await legacyState();
+  const frozen = async () => assert.deepEqual(await legacyState(), before);
+  const missing = { error: "El diagrama solicitado no existe." };
+  const session = await request("/api/auth/session", "owner");
+  assert.equal(session.status, 200);
+  const accountId = session.body.user.id;
+  assert.equal(typeof accountId, "string");
+  expect(await request("/api/files", "owner"), 200, { files: [] });
+  expect(await request("/api/diagrams", "owner"), 200, { diagrams: [] });
+  for (const name of ["frozen", "legacy-only"]) {
+    expect(await request(`/api/files/${name}`, "owner"), 404, missing);
+  }
+  await frozen();
+  const url = "/api/files/frozen";
+  const created = await request(url, "owner", "PUT", scene);
+  assert.equal(created.status, 200);
+  const id = created.etag.slice(1).split(":")[0];
+  const route = `/api/diagrams/${id}`;
+  expect(await request(url, "owner"), 200, { file: created.body.file, scene });
+  await frozen();
+  const replacement = { elements: [{ id: "canonical-update" }] };
+  const updated = await request(route, "owner", "PUT", replacement, { "If-Match": created.etag });
+  assert.equal(updated.status, 200);
+  assert.equal(updated.etag, `"${id}:2"`);
+  expect(await request(route, "owner"), 200, { diagram: updated.body.diagram, scene: replacement });
+  await frozen();
+  expect(await request(url, "owner", "DELETE"), 200,
+    { ok: true, file: { name: "frozen", fileName: "frozen.excalidraw.json" } });
+  expect(await request(route, "owner"), 404, missing);
+  expect(await request(url, "owner"), 404, missing);
+  expect(await request("/api/files", "owner"), 200, { files: [] });
+  await frozen();
+  const remaining = await request("/api/files/remaining", "owner", "PUT", replacement);
+  assert.equal(remaining.status, 200);
+  const remainingRoute = `/api/diagrams/${remaining.etag.slice(1).split(":")[0]}`;
+  assert.equal((await request(`${remainingRoute}/members`, "owner", "POST", { username: "member" })).status, 201);
+  const shared = await request(remainingRoute, "member");
+  assert.equal(shared.status, 200);
+  assert.deepEqual(shared.body.scene, replacement);
+  await frozen();
+  expect(await request(`/api/admin/users/${accountId}`, "admin", "DELETE"), 200,
+    { ok: true, user: { id: accountId, username: "owner" } });
+  expect(await request(remainingRoute, "member"), 404, missing);
+  expect(await request("/api/diagrams", "member"), 200, { diagrams: [] });
+  const accounts = await request("/api/admin/users", "admin");
+  assert.equal(accounts.status, 200);
+  assert.ok(!accounts.body.users.some((user) => user.id === accountId));
+  await frozen();
+});
+
+test("stored owner IDs above safe integer retain exact backup paths through file deletion", { timeout: 60_000 }, async (t) => {
+  const f = await persistenceFixture(t);
+  const ownerId = "9007199254740993";
+  await f.setup("UPDATE fixture_schema.users SET id = $1 WHERE username = 'owner'", [ownerId]);
+  await f.loginAs("owner", "owner");
+  const session = await f.request("/api/auth/session", "owner");
+  assert.equal(session.status, 200);
+  assert.equal(session.body.user.id, ownerId);
+  const saved = await f.request("/api/files/Exact Owner!!", "owner", "PUT", scene);
+  assert.equal(saved.status, 200);
+  assert.equal(saved.warning, null);
+  const id = saved.etag.slice(1).split(":")[0];
+  const route = `/api/diagrams/${id}`;
+  const loaded = await f.request(route, "owner");
+  expect(loaded, 200, { diagram: { id, revision: "1", ...saved.body.file }, scene });
+  assert.equal(loaded.etag, saved.etag);
+  const exact = path.join(f.directory, ".owners-v1", ownerId, "exact-owner.excalidraw.json");
+  assert.equal(await readFile(exact, "utf8"), `${JSON.stringify(scene, null, 2)}\n`);
+  assert.deepEqual(await readdir(path.join(f.directory, ".owners-v1")), [ownerId]);
+  await assert.rejects(readFile(path.join(f.directory, ".owners-v1", "9007199254740992",
+    "exact-owner.excalidraw.json")), { code: "ENOENT" });
+  expect(await f.request("/api/files/exact-owner", "owner", "DELETE"), 200,
+    { ok: true, file: { name: "exact-owner", fileName: "exact-owner.excalidraw.json" } });
+  assert.equal((await f.request(route, "owner")).status, 404);
+  expect(await f.request("/api/files", "owner"), 200, { files: [] });
+  await assert.rejects(readFile(exact), { code: "ENOENT" });
+  assert.deepEqual(await readdir(path.dirname(exact)), []);
+});
+
+test("namespace root obstruction preserves bytes and reports canonical save success", { timeout: 60_000 }, async (t) => {
+  const sentinel = Buffer.from([0, 255, 17, 10]);
+  const f = await persistenceFixture(t, { seedData: (root) =>
+    writeFile(path.join(root, ".owners-v1"), sentinel) });
+  expect(await f.request("/api/diagrams", "owner"), 200, { diagrams: [] });
+  const saved = await f.request("/api/files/blocked-root", "owner", "PUT", scene);
+  assert.equal(saved.status, 200);
+  assert.equal(saved.warning, "diagram-backup-failed");
+  assert.equal(saved.body.warning, "diagram-backup-failed");
+  assert.match(saved.etag, /^"[1-9][0-9]*:1"$/);
+  const id = saved.etag.slice(1).split(":")[0];
+  const route = `/api/diagrams/${id}`;
+  const created = await f.request(route, "owner");
+  assert.equal(created.etag, saved.etag);
+  assert.deepEqual(created.body.scene, scene);
+  assert.deepEqual(await readFile(path.join(f.directory, ".owners-v1")), sentinel);
+  const replacement = { elements: [{ id: "canonical-despite-obstruction" }] };
+  const updated = await f.request(route, "owner", "PUT", replacement, { "If-Match": saved.etag });
+  assert.equal(updated.status, 200);
+  assert.equal(updated.warning, "diagram-backup-failed");
+  assert.equal(updated.body.warning, "diagram-backup-failed");
+  assert.equal(updated.etag, `"${id}:2"`);
+  const loaded = await f.request(route, "owner");
+  expect(loaded, 200, { diagram: updated.body.diagram, scene: replacement });
+  assert.equal(loaded.etag, updated.etag);
+  const { id: _id, revision: _revision, ...file } = updated.body.diagram;
+  expect(await f.request("/api/files/blocked-root", "owner"), 200, { file, scene: replacement });
+  expect(await f.request("/api/diagrams", "owner"), 200, { diagrams: [updated.body.diagram] });
+  assert.deepEqual(await readFile(path.join(f.directory, ".owners-v1")), sentinel);
+  assert.deepEqual(await readdir(f.directory), [".owners-v1"]);
+});
 
 test("persistence fixture anchors guarded legacy behavior", { timeout: 60_000 }, async (t) => {
   const { request, snapshot, backups } = await persistenceFixture(t);
@@ -500,7 +676,7 @@ test("owner deletion excludes stored-owner operations through filesystem complet
   }
 });
 
-test("directory identity survives username reuse while old owner cleanup is pending", { timeout: 60_000 }, async (t) => {
+test("new account directory progresses independently while old owner cleanup is pending", { timeout: 60_000 }, async (t) => {
   const f = await persistenceFixture(t);
   const { request } = f;
   const url = "/api/files/shared";
@@ -532,9 +708,16 @@ test("directory identity survives username reuse while old owner cleanup is pend
     assert.equal(recreated.status, 201);
     assert.notEqual(recreated.body.user.id, f.users.owner);
     await f.loginAs("new-owner", "owner");
+    assert.notEqual(f.backups.directory("new-owner"), f.backups.directory("owner"));
     fresh = request(url, "new-owner", "PUT", { elements: [{ id: "new-account" }] });
-    await f.blocked(4);
-    expect(await request(url, "new-owner"), 404, { error: "El diagrama solicitado no existe." });
+    const savedDuringCleanup = await fresh;
+    assert.equal(savedDuringCleanup.status, 200);
+    const duringCleanup = await request(url, "new-owner");
+    assert.equal(duringCleanup.status, 200);
+    assert.equal(duringCleanup.etag, savedDuringCleanup.etag);
+    assert.deepEqual(duringCleanup.body.scene, { elements: [{ id: "new-account" }] });
+    assert.equal(await readFile(f.backups.file("new-owner", "shared"), "utf8"),
+      `${JSON.stringify(duringCleanup.body.scene, null, 2)}\n`);
     // Another directory remains usable even while recursive cleanup is paused.
     expect(await request(url, "stranger"), 200, other.body);
   } finally {
@@ -694,5 +877,6 @@ test("owner SQL/cleanup faults retain existing contracts and release coordinatio
   await f.loginAs("new-owner", "owner");
   assert.equal((await request("/api/files/shared", "new-owner", "PUT", scene)).status, 200);
   assert.equal((await request(`/api/admin/users/${recreated.body.user.id}`, "admin", "DELETE")).status, 200);
-  assert.deepEqual((await f.snapshot(id, "shared")).backups, {});
+  // Cleanup of a different account ID must not sweep the failed old-ID backup.
+  assert.deepEqual((await f.snapshot(id, "shared")).backups, before.backups);
 });

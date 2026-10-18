@@ -30,10 +30,11 @@ partial review remains historical. Already omitted data cannot be recovered by t
 Scoped deletion coordination is verified. The administrator self-DELETE guard
 passed API regressions and scoped independent security verification; see
 [guard scope](app/README.md#administrator-self-deletion-guard-t3e0-candidate).
-Backup-directory collisions (e.g. `Foo`/`foo`) remain open. The D3 policy is
-approved, but the ID-namespace cutover is not implemented. It will leave legacy
-backups intact even after account/diagram deletion; migration or cleanup requires
-separate authorization.
+The forward-only backup cutover now writes to `.owners-v1/<account-ID>/`.
+Legacy username folders remain frozen even after account/diagram deletion; historical
+mixed ownership is not repaired. Migration or disposal requires separate authorization.
+Namespace API/build/differential checks and scoped independent verification passed;
+this is not deployment approval.
 See [owner cleanup limits](app/README.md#ordered-owner-cleanup-t3d1-candidate).
 Realtime and collaboration UI remain unfinished; deployment is not authorized.
 
@@ -131,8 +132,8 @@ Docker Compose overrides some server defaults; treat `docker-compose.yml` as the
 - Users authenticate with bcrypt password hashes stored in PostgreSQL.
 - Sessions are stored in PostgreSQL by `connect-pg-simple` and use the `excalidraw.sid` cookie.
 - Diagram queries are scoped to the authenticated user's database ID.
-- Saving a diagram upserts its scene in PostgreSQL and writes a `.excalidraw.json` backup to `data/<username>/`.
-- Deleting a user also deletes that user's diagrams through the database relationship and removes the user's backup directory.
+- Saving a diagram persists its scene in PostgreSQL and writes a `.excalidraw.json` backup to `DATA_DIR/.owners-v1/<stored-account-ID>/`. Backup jobs must include hidden entries.
+- Deleting a user cascades their diagrams and removes only that account-ID backup directory. Legacy username folders stay intact, even after file/account deletion; they are never automatically restored, imported or migrated. Future migration or cleanup needs separate consent.
 - The account whose username is exactly `admin` receives the user-management interface and API permissions.
 
 ## Generate a diagram with AI

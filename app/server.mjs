@@ -58,8 +58,10 @@ const sanitizeBaseName = (value) => {
 };
 
 const fileNameFromName = (name) => `${sanitizeBaseName(name)}${FILE_EXTENSION}`;
-const filePathFromName = (username, name) =>
-  path.join(DATA_DIR, sanitizeBaseName(username), fileNameFromName(name));
+// Stored database IDs only; legacy username directories are never adopted.
+const ownerDataDir = (ownerId) => path.join(DATA_DIR, ".owners-v1", ownerId);
+const filePathFromName = (ownerId, name) =>
+  path.join(ownerDataDir(ownerId), fileNameFromName(name));
 
 const sanitizeUsername = (value) => String(value || "").trim();
 const isAdminUser = (user) => user?.username === "admin";
@@ -75,31 +77,31 @@ const ensureDataDir = async () => {
   await fs.mkdir(DATA_DIR, { recursive: true });
 };
 
-const ensureUserDataDir = async (username) => {
-  const userDir = path.join(DATA_DIR, sanitizeBaseName(username));
+const ensureUserDataDir = async (ownerId) => {
+  const userDir = ownerDataDir(ownerId);
   await fs.mkdir(userDir, { recursive: true });
   return userDir;
 };
 
-const deleteUserDataDir = async (username) => {
-  await fs.rm(path.join(DATA_DIR, sanitizeBaseName(username)), {
+const deleteUserDataDir = async (ownerId) => {
+  await fs.rm(ownerDataDir(ownerId), {
     recursive: true,
     force: true,
   });
 };
 
-const writeDiagramBackup = async (username, name, scene) => {
-  await ensureUserDataDir(username);
+const writeDiagramBackup = async (ownerId, name, scene) => {
+  await ensureUserDataDir(ownerId);
   await fs.writeFile(
-    filePathFromName(username, name),
+    filePathFromName(ownerId, name),
     `${JSON.stringify(scene, null, 2)}\n`,
     "utf8",
   );
 };
 
-const deleteDiagramBackup = async (username, name) => {
+const deleteDiagramBackup = async (ownerId, name) => {
   try {
-    await fs.unlink(filePathFromName(username, name));
+    await fs.unlink(filePathFromName(ownerId, name));
   } catch (error) {
     if (error.code !== "ENOENT") {
       throw error;
@@ -490,9 +492,8 @@ app.delete("/api/admin/users/:id", requireAdmin, async (request, response, next)
       response.status(400).json({ error: "No puedes eliminar tu propio usuario." });
       return;
     }
-    // The physical directory survives account IDs. Exclude even a recreated
-    // account's saves until this account's recursive cleanup has finished.
-    const key = directoryLockKey(initial.username);
+    // Hold this stored account's directory through cascade and recursive cleanup.
+    const key = directoryLockKey(initial.id);
     await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [key]);
     lockKey = key;
     const result = await client.query(
@@ -501,7 +502,7 @@ app.delete("/api/admin/users/:id", requireAdmin, async (request, response, next)
         WHERE id = $1 AND username = $2
         RETURNING id, username
       `,
-      [userId, initial.username],
+      [initial.id, initial.username],
     );
 
     if (result.rowCount === 0) {
@@ -509,7 +510,7 @@ app.delete("/api/admin/users/:id", requireAdmin, async (request, response, next)
       return;
     }
 
-    await deleteUserDataDir(result.rows[0].username);
+    await deleteUserDataDir(result.rows[0].id);
 
     response.json({
       ok: true,
@@ -636,11 +637,11 @@ app.get("/api/diagrams/:id", requireAuth, async (request, response, next) => {
 
 const diagramLockKey = (ownerId, name) =>
   JSON.stringify([DB_SCHEMA, ownerId, sanitizeBaseName(name)]);
-const directoryLockKey = (username) =>
-  JSON.stringify(["directory", path.join(DATA_DIR, sanitizeBaseName(username))]);
+const directoryLockKey = (ownerId) =>
+  JSON.stringify(["directory", ownerDataDir(ownerId)]);
 
 // Shared directory BEFORE document; owner deletion holds the directory exclusively.
-// Session locks span canonical commit and filesystem completion, including username reuse.
+// Session locks span canonical commit and filesystem completion for one stored owner.
 const replaceDiagram = async ({ id, name }, userId, match, scene) => {
   const client = await pool.connect();
   let directoryKey;
@@ -661,7 +662,7 @@ const replaceDiagram = async ({ id, name }, userId, match, scene) => {
       : (await client.query(`SELECT id AS user_id, username, $2::text AS name
           FROM ${DB_SCHEMA}.users WHERE id = $1 AND is_active`, target)).rows[0];
     if (!initial) return reject(404, "El diagrama solicitado no existe.");
-    const directory = directoryLockKey(initial.username);
+    const directory = directoryLockKey(initial.user_id);
     await client.query("SELECT pg_advisory_lock_shared(hashtextextended($1, 0))", [directory]);
     directoryKey = directory;
     const key = diagramLockKey(initial.user_id, initial.name);
@@ -714,7 +715,7 @@ const replaceDiagram = async ({ id, name }, userId, match, scene) => {
     const diagram = result.rows[0];
     const body = { ok: true, diagram: getDiagramPayload(diagram) };
     try {
-      await writeDiagramBackup(owner.username, owner.name, scene);
+      await writeDiagramBackup(owner.user_id, owner.name, scene);
     } catch (error) {
       console.error("Canonical diagram saved; backup failed.", error);
       body.warning = "diagram-backup-failed";
@@ -906,16 +907,16 @@ app.delete("/api/files/:name", requireAuth, async (request, response, next) => {
   try {
     const name = sanitizeBaseName(request.params.name);
     client = await pool.connect();
-    const initial = (await client.query(`SELECT username FROM ${DB_SCHEMA}.users WHERE id = $1`,
+    const initial = (await client.query(`SELECT id, username FROM ${DB_SCHEMA}.users WHERE id = $1`,
       [request.session.user.id])).rows[0];
     if (!initial) {
       response.status(404).json({ error: "El diagrama solicitado no existe." });
       return;
     }
-    const directory = directoryLockKey(initial.username);
+    const directory = directoryLockKey(initial.id);
     await client.query("SELECT pg_advisory_lock_shared(hashtextextended($1, 0))", [directory]);
     directoryKey = directory;
-    const key = diagramLockKey(request.session.user.id, name);
+    const key = diagramLockKey(initial.id, name);
     await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [key]);
     lockKey = key;
     // Resolve the stored owner under coordination, not from a stale session username.
@@ -926,9 +927,9 @@ app.delete("/api/files/:name", requireAuth, async (request, response, next) => {
         USING ${DB_SCHEMA}.users AS owner
         WHERE diagrams.user_id = $1 AND diagrams.name = $2 AND owner.id = diagrams.user_id
           AND owner.username = $3
-        RETURNING diagrams.name, owner.username
+        RETURNING diagrams.name, owner.id AS owner_id
       `,
-      [request.session.user.id, name, initial.username],
+      [initial.id, name, initial.username],
     );
 
     if (result.rowCount === 0) {
@@ -936,7 +937,7 @@ app.delete("/api/files/:name", requireAuth, async (request, response, next) => {
       return;
     }
 
-    await deleteDiagramBackup(result.rows[0].username, name);
+    await deleteDiagramBackup(result.rows[0].owner_id, name);
 
     response.json({
       ok: true,

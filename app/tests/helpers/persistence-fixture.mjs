@@ -10,7 +10,7 @@ import bcrypt from "bcryptjs";
 import pg from "pg";
 import { backupPaths } from "./backup-paths.mjs";
 
-export const persistenceFixture = async (t) => {
+export const persistenceFixture = async (t, { seedData } = {}) => {
   assert.equal(process.env.API_TEST_ISOLATED, "1", "Use npm run test:api");
   const schema = `persistence_${randomUUID().replaceAll("-", "")}`;
   const directory = await mkdtemp(path.join(tmpdir(), "excalidraw-persistence-"));
@@ -25,6 +25,7 @@ export const persistenceFixture = async (t) => {
     await pool.end();
     // The isolated runner's container owns and discards this temporary directory.
   });
+  if (seedData) await seedData(directory);
   let output = "";
   server = spawn(process.execPath, ["--import", fileURLToPath(new URL("./storage-barrier.mjs", import.meta.url)),
     fileURLToPath(new URL("../../server.mjs", import.meta.url))], {
