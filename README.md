@@ -30,8 +30,10 @@ partial review remains historical. Already omitted data cannot be recovered by t
 Scoped deletion coordination is verified. The administrator self-DELETE guard
 passed API regressions and scoped independent security verification; see
 [guard scope](app/README.md#administrator-self-deletion-guard-t3e0-candidate).
-Backup-directory collisions (e.g. `Foo`/`foo`) remain open, with storage cutover
-awaiting the D3 legacy-retention decision; no automatic backup migration/deletion.
+Backup-directory collisions (e.g. `Foo`/`foo`) remain open. The D3 policy is
+approved, but the ID-namespace cutover is not implemented. It will leave legacy
+backups intact even after account/diagram deletion; migration or cleanup requires
+separate authorization.
 See [owner cleanup limits](app/README.md#ordered-owner-cleanup-t3d1-candidate).
 Realtime and collaboration UI remain unfinished; deployment is not authorized.
 

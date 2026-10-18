@@ -7,6 +7,7 @@ import path from "node:path";
 import test from "node:test";
 import bcrypt from "bcryptjs";
 import pg from "pg";
+import { backupPaths } from "./helpers/backup-paths.mjs";
 
 assert.equal(process.env.API_TEST_ISOLATED, "1", "Use npm run test:api");
 const schema = "revision_test";
@@ -76,10 +77,13 @@ test("public revision foundation and additive migrations", { timeout: 60_000 }, 
   };
   await start();
   const cookies = {};
+  const users = {};
+  const backups = backupPaths(directory, users);
   for (const username of ["owner", "member", "stranger", "admin"]) {
     const result = await request("/api/auth/login", null, "POST", { username, password: "fixture-password" });
     assert.equal(result.status, 200);
     cookies[username] = result.cookie;
+    users[username] = result.body.user;
   }
   const route = `/api/diagrams/${id}`;
   const legacy = "/api/files/old";
@@ -142,7 +146,7 @@ test("public revision foundation and additive migrations", { timeout: 60_000 }, 
     assert.equal(loaded.etag, before.etag);
     assert.deepEqual(loaded.body, before.body);
   });
-  const backup = path.join(directory, "owner", "old.excalidraw.json");
+  const backup = backups.file("owner", "old");
   await t.test("legacy normalized overwrite increments once, retains ID, raw scene and JSON shape", async () => {
     const prior = await request(route, cookies.owner);
     const saved = await request("/api/files/Old!!", cookies.owner, "PUT", scene, { "If-Match": prior.etag });
@@ -168,8 +172,8 @@ test("public revision foundation and additive migrations", { timeout: 60_000 }, 
     ["overflow", maximum, maximum], ["last", "9223372036854775806", "9007199254740995"]]) {
     await pool.query(`INSERT INTO ${schema}.diagrams (id, user_id, name, scene_json, revision, updated_at)
       VALUES ($1, 1, $2, $3, $4, $5)`, [fixtureId, name, JSON.stringify(scene), revision, timestamp]);
-    await mkdir(path.join(directory, "owner"), { recursive: true });
-    await writeFile(path.join(directory, "owner", `${name}.excalidraw.json`), `${JSON.stringify(scene)}\n`);
+    await mkdir(backups.directory("owner"), { recursive: true });
+    await writeFile(backups.file("owner", name), `${JSON.stringify(scene)}\n`);
   }
   await t.test("revisions above safe integer stay exact through reads and SQL increments", async () => {
     const prior = await request("/api/files/precise", cookies.owner);
@@ -182,7 +186,7 @@ test("public revision foundation and additive migrations", { timeout: 60_000 }, 
   await t.test("BIGINT overflow rejects without changing scene, revision, timestamp or backup", async () => {
     const url = `/api/diagrams/${maximum}`;
     const before = await request(url, cookies.owner);
-    const boundaryBackup = path.join(directory, "owner", "overflow.excalidraw.json");
+    const boundaryBackup = backups.file("owner", "overflow");
     const bytes = await readFile(boundaryBackup, "utf8");
     expect(await request("/api/files/overflow", cookies.owner, "PUT", { elements: [] }, { "If-Match": before.etag }), 409,
       { error: "El diagrama ha alcanzado el limite de revisiones." });
@@ -198,7 +202,7 @@ test("public revision foundation and additive migrations", { timeout: 60_000 }, 
     assert.equal(saved.etag, `"9007199254740995:${maximum}"`);
     const url = "/api/diagrams/9007199254740995";
     const before = await request(url, cookies.owner);
-    const boundaryBackup = path.join(directory, "owner", "last.excalidraw.json");
+    const boundaryBackup = backups.file("owner", "last");
     const bytes = await readFile(boundaryBackup, "utf8");
     expect(await request("/api/files/last", cookies.owner, "PUT", {}, { "If-Match": before.etag }), 400,
       { error: "El contenido del diagrama no es valido." });

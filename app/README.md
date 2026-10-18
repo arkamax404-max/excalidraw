@@ -257,8 +257,9 @@ and private-file boundaries.
 This repairs future saves only: it cannot recover binary files or deleted elements
 already omitted from stored scenes. T3c2's scoped persistence assurance is verified.
 Scoped T3d1 deletion coordination and the administrator self-deletion guard passed
-independent verification. The backup-directory collision still awaits the D3
-legacy-retention decision; realtime and collaboration UI are unfinished.
+independent verification. The backup-directory collision still requires the
+account-ID namespace implementation. The D3 frozen-legacy policy is approved,
+but the cutover, realtime and collaboration UI are unfinished.
 Deployment is not authorized.
 
 ### Guarded stable-ID replacement (T3b)

@@ -8,6 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import bcrypt from "bcryptjs";
 import pg from "pg";
+import { backupPaths } from "./backup-paths.mjs";
 
 export const persistenceFixture = async (t) => {
   assert.equal(process.env.API_TEST_ISOLATED, "1", "Use npm run test:api");
@@ -43,6 +44,8 @@ export const persistenceFixture = async (t) => {
 
   const cookies = {};
   const users = {};
+  const accounts = {};
+  const backups = backupPaths(directory, accounts);
   const request = async (route, user, method = "GET", body, headers = {}) => {
     const response = await fetch(`http://127.0.0.1:3035${route}`, {
       method,
@@ -60,6 +63,7 @@ export const persistenceFixture = async (t) => {
     assert.equal(login.status, 200);
     assert.ok(login.cookie);
     cookies[username] = login.cookie;
+    accounts[username] = login.body.user;
   }
 
   const backupTree = async (relative = "") => {
@@ -124,7 +128,7 @@ export const persistenceFixture = async (t) => {
   };
   const directoryLock = async () => {
     const client = await pool.connect();
-    const key = JSON.stringify(["directory", path.join(directory, "owner")]);
+    const key = JSON.stringify(["directory", backups.directory("owner")]);
     await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [key]);
     return async () => {
       await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [key]);
@@ -135,7 +139,8 @@ export const persistenceFixture = async (t) => {
     const login = await request("/api/auth/login", null, "POST", { username, password: "fixture-password" });
     assert.equal(login.status, 200);
     cookies[alias] = login.cookie;
+    accounts[alias] = login.body.user;
   };
   return { request, snapshot, setup, directory, users, storageBarrier, blocked, documentLock,
-    directoryLock, loginAs, logs: () => output };
+    directoryLock, loginAs, backups, logs: () => output };
 };

@@ -7,6 +7,7 @@ import path from "node:path";
 import test from "node:test";
 import bcrypt from "bcryptjs";
 import pg from "pg";
+import { backupPaths } from "./helpers/backup-paths.mjs";
 
 assert.equal(process.env.API_TEST_ISOLATED, "1", "Use npm run test:api");
 const schema = `membership_${process.pid}`;
@@ -57,6 +58,7 @@ test("owner-controlled membership HTTP contracts", { timeout: 60_000 }, async (t
   assert.match(output, /Excalidraw auth server listening/);
   const cookies = {};
   const users = {};
+  const backups = backupPaths(directory, users);
   const hash = await bcrypt.hash("fixture-password", 4);
   for (const username of ["owner", "member", "stranger", "admin", "inactive"]) {
     // SQL only provisions accounts and a full-range diagram ID, never asserts behavior.
@@ -90,7 +92,7 @@ test("owner-controlled membership HTTP contracts", { timeout: 60_000 }, async (t
     legacy: await Promise.all(["owner", "member"].map(async (name) => ({
       list: (await request("/api/files", cookies[name])).body,
       load: (await request("/api/files/same-name", cookies[name])).body,
-      backup: await readFile(path.join(directory, name, "same-name.excalidraw.json"), "utf8"),
+      backup: await readFile(backups.file(name, "same-name"), "utf8"),
     }))),
   });
   const rejected = async (url, cookie, method, body, status, payload) => {
@@ -188,7 +190,7 @@ test("owner-controlled membership HTTP contracts", { timeout: 60_000 }, async (t
     expect(await request("/api/diagrams", cookies.owner), 200, ownerList);
     expect(await request(route, cookies.member), 404, missing);
     assert.deepEqual((await request(route, cookies.owner)).body.scene, scene);
-    assert.deepEqual(JSON.parse(await readFile(path.join(directory, "owner", "same-name.excalidraw.json"))), scene);
+    assert.deepEqual(JSON.parse(await readFile(backups.file("owner", "same-name"))), scene);
   });
   await t.test("diagram deletion cascades memberships; recreation does not inherit grants", async () => {
     const stranger = { ...users.stranger };
@@ -209,7 +211,7 @@ test("owner-controlled membership HTTP contracts", { timeout: 60_000 }, async (t
       { ok: true, user: { id: users.owner.id, username: "owner" } });
     expect(await request(`/api/diagrams/${fresh}`, cookies.stranger), 404, missing);
     expect(await request("/api/diagrams", cookies.stranger), 200, { diagrams: [] });
-    await assert.rejects(readFile(path.join(directory, "owner", "same-name.excalidraw.json")), { code: "ENOENT" });
+    await assert.rejects(readFile(backups.file("owner", "same-name")), { code: "ENOENT" });
     const accounts = await request("/api/admin/users", cookies.admin);
     assert.equal(accounts.status, 200);
     assert.ok(accounts.body.users.some((user) => user.username === "stranger"));

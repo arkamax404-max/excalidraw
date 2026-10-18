@@ -7,6 +7,7 @@ import path from "node:path";
 import test from "node:test";
 import bcrypt from "bcryptjs";
 import pg from "pg";
+import { backupPaths } from "./helpers/backup-paths.mjs";
 
 // Run only via the disposable Docker runner, not against a developer's database.
 assert.equal(process.env.API_TEST_ISOLATED, "1", "Use npm run test:api");
@@ -78,9 +79,12 @@ test("authentication and private diagram storage baseline", { timeout: 60_000 },
 
   // Fixture provisioning is the only direct database access in the test.
   const hash = await bcrypt.hash("fixture-password", 4);
+  const users = {};
   for (const username of ["admin", "alice", "bob"]) {
-    await pool.query(`INSERT INTO ${schema}.users (username, password_hash) VALUES ($1, $2)`, [username, hash]);
+    users[username] = (await pool.query(`INSERT INTO ${schema}.users (username, password_hash)
+      VALUES ($1, $2) RETURNING id, username`, [username, hash])).rows[0];
   }
+  const backups = backupPaths(directory, users);
 
   await t.test("anonymous requests do not authenticate or create backups", async () => {
     expectResponse(await request("/api/auth/session"), 200, { authenticated: false });
@@ -134,7 +138,7 @@ test("authentication and private diagram storage baseline", { timeout: 60_000 },
     expectResponse(await request("/api/files/private-diagram", { cookie: alice }), 200,
       { file: overwritten.body.file, scene: updated });
     expectResponse(await request("/api/files", { cookie: alice }), 200, { files: [overwritten.body.file] });
-    assert.deepEqual(JSON.parse(await readFile(path.join(directory, "alice/private-diagram.excalidraw.json"), "utf8")), updated);
+    assert.deepEqual(JSON.parse(await readFile(backups.file("alice", "private-diagram"), "utf8")), updated);
   });
 
   await t.test("private diagrams are invisible and cannot be deleted by another user", async () => {
@@ -155,7 +159,7 @@ test("authentication and private diagram storage baseline", { timeout: 60_000 },
   await t.test("invalid saves leave existing scene, timestamp, listing and backup unchanged", async () => {
     const before = await request("/api/files/private-diagram", { cookie: alice });
     const listing = await request("/api/files", { cookie: alice });
-    const backupPath = path.join(directory, "alice/private-diagram.excalidraw.json");
+    const backupPath = backups.file("alice", "private-diagram");
     const backup = await readFile(backupPath, "utf8");
     for (const name of ["private-diagram", "new-invalid"]) {
       expectResponse(await request(`/api/files/${name}`, { method: "PUT", cookie: alice, body: { elements: "invalid" },
@@ -167,7 +171,7 @@ test("authentication and private diagram storage baseline", { timeout: 60_000 },
     expectResponse(await request("/api/files/new-invalid", { cookie: alice }), 404,
       { error: "El diagrama solicitado no existe." });
     assert.equal(await readFile(backupPath, "utf8"), backup);
-    assert.deepEqual(await readdir(path.join(directory, "alice")), ["private-diagram.excalidraw.json"]);
+    assert.deepEqual(await readdir(backups.directory("alice")), ["private-diagram.excalidraw.json"]);
   });
 
   await t.test("delete removes only the owner's diagram and backup", async () => {
@@ -177,7 +181,7 @@ test("authentication and private diagram storage baseline", { timeout: 60_000 },
     expectResponse(await request("/api/files", { cookie: alice }), 200, { files: [] });
     expectResponse(await request("/api/files/private-diagram", { cookie: alice }), 404,
       { error: "El diagrama solicitado no existe." });
-    assert.deepEqual(await readdir(path.join(directory, "alice")), []);
+    assert.deepEqual(await readdir(backups.directory("alice")), []);
     expectResponse(await request("/api/files/private-diagram", { cookie: bob }), 200, bobBefore.body);
   });
 });

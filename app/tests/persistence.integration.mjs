@@ -12,7 +12,7 @@ const expect = (result, status, body) => {
 };
 
 test("persistence fixture anchors guarded legacy behavior", { timeout: 60_000 }, async (t) => {
-  const { request, snapshot } = await persistenceFixture(t);
+  const { request, snapshot, backups } = await persistenceFixture(t);
   const legacy = "/api/files/shared-scene";
   const created = await request("/api/files/Shared Scene!!", "owner", "PUT", scene);
   assert.equal(created.status, 200);
@@ -34,7 +34,7 @@ test("persistence fixture anchors guarded legacy behavior", { timeout: 60_000 },
     expect(await request("/api/diagrams", "owner"), 200, { diagrams: [metadata("1")] });
     expect(await request("/api/files", "owner"), 200, { files: [file] });
     assert.deepEqual((await snapshot(id, "shared-scene")).backups,
-      { "owner/shared-scene.excalidraw.json": `${JSON.stringify(scene, null, 2)}\n` });
+      { [backups.relative("owner", "shared-scene")]: `${JSON.stringify(scene, null, 2)}\n` });
   });
 
   await t.test("member reads share identity without changing ownership or backup location", async () => {
@@ -73,7 +73,7 @@ test("persistence fixture anchors guarded legacy behavior", { timeout: 60_000 },
     expect(await request("/api/files", "owner"), 200, { files: [saved.body.file] });
     expect(await request("/api/diagrams", "owner"), 200, { diagrams: [metadata("2", saved.body.file)] });
     assert.deepEqual((await snapshot(id, "shared-scene")).backups,
-      { "owner/shared-scene.excalidraw.json": `${JSON.stringify(replacement, null, 2)}\n` });
+      { [backups.relative("owner", "shared-scene")]: `${JSON.stringify(replacement, null, 2)}\n` });
     const next = await request("/api/files/after-replacement", "owner", "PUT", scene);
     assert.equal(next.status, 200);
     assert.equal(next.etag, `"${BigInt(id) + 2n}:1"`, "legacy replacement retains historical ID allocation");
@@ -81,7 +81,7 @@ test("persistence fixture anchors guarded legacy behavior", { timeout: 60_000 },
 });
 
 test("guarded stable-ID persistence contracts", { timeout: 60_000 }, async (t) => {
-  const { request, snapshot, setup, directory, logs } = await persistenceFixture(t);
+  const { request, snapshot, setup, backups, logs } = await persistenceFixture(t);
   const created = await request("/api/files/guarded", "owner", "PUT", scene);
   const id = created.etag.slice(1).split(":")[0];
   const route = `/api/diagrams/${id}`;
@@ -137,7 +137,7 @@ test("guarded stable-ID persistence contracts", { timeout: 60_000 }, async (t) =
       expect(loaded, 200, { diagram: saved.body.diagram, scene: replacement });
       assert.equal(loaded.etag, token);
       assert.deepEqual((await snapshot(id, "guarded")).backups,
-        { "owner/guarded.excalidraw.json": `${JSON.stringify(replacement, null, 2)}\n` });
+        { [backups.relative("owner", "guarded")]: `${JSON.stringify(replacement, null, 2)}\n` });
     }
     await unchanged(() => save("owner", created.etag), 412, { error: "La version del diagrama no coincide." });
   });
@@ -159,7 +159,7 @@ test("guarded stable-ID persistence contracts", { timeout: 60_000 }, async (t) =
     const loaded = await request(route, "owner");
     expect(loaded, 200, { diagram: winner.body.diagram, scene });
     assert.equal(loaded.etag, token);
-    assert.equal((await snapshot(id, "guarded")).backups["owner/guarded.excalidraw.json"],
+    assert.equal((await snapshot(id, "guarded")).backups[backups.relative("owner", "guarded")],
       `${JSON.stringify(scene, null, 2)}\n`);
   });
   await t.test("SQL rollback releases coordination and recovery can use the same token", async () => {
@@ -199,7 +199,7 @@ test("guarded stable-ID persistence contracts", { timeout: 60_000 }, async (t) =
   await t.test("post-commit backup failure is canonical success with a safe warning", async () => {
     await setup(`INSERT INTO fixture_schema.diagrams (user_id, name, scene_json)
       SELECT id, 'blocked', $1::jsonb FROM fixture_schema.users WHERE username = 'owner'`, [JSON.stringify(scene)]);
-    await mkdir(path.join(directory, "owner", "blocked.excalidraw.json"));
+    await mkdir(backups.file("owner", "blocked"));
     const listed = await request("/api/diagrams", "owner");
     const target = listed.body.diagrams.find((diagram) => diagram.name === "blocked");
     const url = `/api/diagrams/${target.id}`;
@@ -224,7 +224,7 @@ test("guarded stable-ID persistence contracts", { timeout: 60_000 }, async (t) =
 });
 
 test("legacy saves share guarded owner/name persistence", { timeout: 60_000 }, async (t) => {
-  const { request, snapshot, setup, directory } = await persistenceFixture(t);
+  const { request, snapshot, setup, backups } = await persistenceFixture(t);
   const url = "/api/files/Legacy Name!!";
   const first = await request(url, "owner", "PUT", scene);
   assert.equal(first.status, 200);
@@ -260,7 +260,7 @@ test("legacy saves share guarded owner/name persistence", { timeout: 60_000 }, a
     assert.equal(loaded.etag, pair[winner].etag);
     assert.equal(loaded.body.diagram.revision, "2");
     assert.deepEqual(loaded.body.scene, variants[winner]);
-    assert.equal((await snapshot(id, "legacy-name")).backups["owner/legacy-name.excalidraw.json"],
+    assert.equal((await snapshot(id, "legacy-name")).backups[backups.relative("owner", "legacy-name")],
       `${JSON.stringify(variants[winner], null, 2)}\n`);
     await rejected(first.etag, 412, "La version del diagrama no coincide.");
   });
@@ -281,7 +281,7 @@ test("legacy saves share guarded owner/name persistence", { timeout: 60_000 }, a
     const loaded = await request("/api/files/fresh-name", "owner");
     expect(loaded, 200, { file: pair[winner].body.file, scene: variants[winner] });
     assert.equal(loaded.etag, pair[winner].etag);
-    assert.equal((await snapshot(id, "legacy-name")).backups["owner/fresh-name.excalidraw.json"],
+    assert.equal((await snapshot(id, "legacy-name")).backups[backups.relative("owner", "fresh-name")],
       `${JSON.stringify(variants[winner], null, 2)}\n`);
   });
   await t.test("deleted identity cannot recreate a name or overwrite its replacement identity", async () => {
@@ -304,7 +304,7 @@ test("legacy saves share guarded owner/name persistence", { timeout: 60_000 }, a
     assert.equal((await save(current.etag)).status, 200);
   });
   await t.test("legacy create backup failure returns canonical success and never repeats creation", async () => {
-    await mkdir(path.join(directory, "owner", "blocked-legacy.excalidraw.json"));
+    await mkdir(backups.file("owner", "blocked-legacy"));
     const blocked = "/api/files/blocked-legacy";
     const saved = await request(blocked, "owner", "PUT", scene);
     expect(saved, 200, { ok: true, file: { name: "blocked-legacy", fileName: "blocked-legacy.excalidraw.json",
@@ -334,7 +334,7 @@ test("legacy saves share guarded owner/name persistence", { timeout: 60_000 }, a
 
 test("diagram deletion orders canonical changes and backup completion", { timeout: 60_000 }, async (t) => {
   const f = await persistenceFixture(t);
-  const { request, snapshot, storageBarrier, blocked, documentLock } = f;
+  const { request, snapshot, storageBarrier, blocked, documentLock, backups } = f;
   const legacy = "/api/files/ordered";
   const missing = { error: "El diagrama solicitado no existe." };
   const deleted = { ok: true, file: { name: "ordered", fileName: "ordered.excalidraw.json" } };
@@ -346,7 +346,7 @@ test("diagram deletion orders canonical changes and backup completion", { timeou
     expect(await request("/api/diagrams", "owner"), 200, { diagrams: [] });
     expect(await request("/api/diagrams", "member"), 200, { diagrams: [] });
     assert.deepEqual((await snapshot(id, "ordered")).backups,
-      { "stranger/ordered.excalidraw.json": `${JSON.stringify(scene, null, 2)}\n` });
+      { [backups.relative("stranger", "ordered")]: `${JSON.stringify(scene, null, 2)}\n` });
     expect(await request(legacy, "stranger"), 200, otherBefore.body);
     assert.equal((await request(legacy, "stranger")).etag, other.etag);
   };
@@ -355,7 +355,7 @@ test("diagram deletion orders canonical changes and backup completion", { timeou
       const created = await request(legacy, "owner", "PUT", scene);
       const id = created.etag.slice(1).split(":")[0];
       await request(`/api/diagrams/${id}/members`, "owner", "POST", { username: "member" });
-      const barrier = await storageBarrier("writeFile", "owner/ordered.excalidraw.json");
+      const barrier = await storageBarrier("writeFile", backups.relative("owner", "ordered"));
       const replacement = { elements: [{ id: mode }] };
       const saving = request(mode === "legacy" ? legacy : `/api/diagrams/${id}`,
         mode === "legacy" ? "owner" : "member", "PUT", replacement, { "If-Match": created.etag });
@@ -378,7 +378,7 @@ test("diagram deletion orders canonical changes and backup completion", { timeou
       const created = await request(legacy, "owner", "PUT", scene);
       const id = created.etag.slice(1).split(":")[0];
       await request(`/api/diagrams/${id}/members`, "owner", "POST", { username: "member" });
-      const barrier = await storageBarrier("unlink", "owner/ordered.excalidraw.json");
+      const barrier = await storageBarrier("unlink", backups.relative("owner", "ordered"));
       const unlock = await documentLock("ordered");
       let saving;
       const removing = request(legacy, "owner", "DELETE");
@@ -419,7 +419,7 @@ test("diagram deletion orders canonical changes and backup completion", { timeou
     expect(await request(legacy, null, "DELETE"), 401, { error: "Necesitas iniciar sesion." });
     for (const user of ["member", "admin"]) expect(await request(legacy, user, "DELETE"), 404, missing);
     assert.deepEqual(await snapshot(id, "ordered"), before);
-    await unlink(path.join(f.directory, "owner/ordered.excalidraw.json"));
+    await unlink(path.join(f.directory, backups.relative("owner", "ordered")));
     expect(await request("/api/files/Ordered!!", "owner", "DELETE", undefined, { "If-Match": "invalid" }),
       200, deleted);
     expect(await request(legacy, "owner", "DELETE"), 404, missing);
@@ -437,7 +437,7 @@ test("diagram deletion orders canonical changes and backup completion", { timeou
     expect(await request(legacy, "owner", "DELETE"), 500, internal);
     assert.deepEqual(await snapshot(id, "ordered"), before);
     await f.setup("DROP TRIGGER reject_delete ON fixture_schema.diagrams");
-    const barrier = await storageBarrier("unlink", "owner/ordered.excalidraw.json", true);
+    const barrier = await storageBarrier("unlink", backups.relative("owner", "ordered"), true);
     const removing = request(legacy, "owner", "DELETE");
     await barrier.blocked;
     barrier.release();
@@ -468,7 +468,7 @@ test("owner deletion excludes stored-owner operations through filesystem complet
       await request(url, "stranger", "PUT", scene);
       const other = await request(url, "stranger");
       const barrier = await f.storageBarrier(mode === "diagram-delete" ? "unlink" : "writeFile",
-        "owner/shared.excalidraw.json");
+        f.backups.relative("owner", "shared"));
       const operation = mode === "diagram-delete" ? request(url, "owner", "DELETE")
         : request(mode === "legacy" ? url : `/api/diagrams/${id}`,
           mode === "legacy" ? "owner" : "member", "PUT", { elements: [{ id: mode }] },
@@ -494,7 +494,7 @@ test("owner deletion excludes stored-owner operations through filesystem complet
       const accounts = await request("/api/admin/users", "admin");
       assert.ok(accounts.body.users.some((user) => user.username === "member"));
       assert.deepEqual((await f.snapshot(id, "shared")).backups,
-        { "stranger/shared.excalidraw.json": `${JSON.stringify(scene, null, 2)}\n` });
+        { [f.backups.relative("stranger", "shared")]: `${JSON.stringify(scene, null, 2)}\n` });
       expect(await request(url, "stranger"), 200, other.body);
     });
   }
@@ -509,7 +509,7 @@ test("directory identity survives username reuse while old owner cleanup is pend
   await request(`/api/diagrams/${id}/members`, "owner", "POST", { username: "member" });
   await request(url, "stranger", "PUT", scene);
   const other = await request(url, "stranger");
-  const barrier = await f.storageBarrier("rm", "owner");
+  const barrier = await f.storageBarrier("rm", f.backups.relative("owner"));
   const unlock = await f.directoryLock();
   const deleting = request(`/api/admin/users/${f.users.owner}`, "admin", "DELETE");
   const pending = [];
@@ -557,8 +557,8 @@ test("directory identity survives username reuse while old owner cleanup is pend
     404, { error: "El diagrama solicitado no existe." });
   assert.deepEqual(await f.snapshot(id, "shared"), before);
   assert.deepEqual(before.backups, {
-    "owner/shared.excalidraw.json": `${JSON.stringify(loaded.body.scene, null, 2)}\n`,
-    "stranger/shared.excalidraw.json": `${JSON.stringify(scene, null, 2)}\n`,
+    [f.backups.relative("new-owner", "shared")]: `${JSON.stringify(loaded.body.scene, null, 2)}\n`,
+    [f.backups.relative("stranger", "shared")]: `${JSON.stringify(scene, null, 2)}\n`,
   });
   expect(await request(`/api/diagrams/${saved.etag.slice(1).split(":")[0]}/members`, "new-owner"),
     200, { members: [] });
@@ -596,7 +596,7 @@ test("admin self-deletion rejects the selected identity without public side effe
       assert.equal(before.accounts.body.users.find((user) => user.id === adminId).diagramCount, 1);
       assert.equal(before[`member:${route}`].etag, created.etag);
       assert.deepEqual(before[`member:${route}`].body.scene, scene);
-      assert.equal(before.snapshot.backups["admin/admin-owned.excalidraw.json"],
+      assert.equal(before.snapshot.backups[f.backups.relative("admin", "admin-owned")],
         `${JSON.stringify(scene, null, 2)}\n`);
       const aliases = large ? [adminId, "9007199254740993"]
         : [adminId, `0${adminId}`, `${adminId}.0`, `${adminId}e0`, `+${adminId}`,
@@ -677,7 +677,7 @@ test("owner SQL/cleanup faults retain existing contracts and release coordinatio
   await f.setup("DROP TRIGGER reject_owner ON fixture_schema.users");
   assert.equal((await request(`/api/diagrams/${id}`, "member", "PUT", scene,
     { "If-Match": created.etag })).status, 200);
-  const barrier = await f.storageBarrier("rm", "owner", true);
+  const barrier = await f.storageBarrier("rm", f.backups.relative("owner"), true);
   const deleting = request(url, "admin", "DELETE");
   await barrier.blocked;
   barrier.release();

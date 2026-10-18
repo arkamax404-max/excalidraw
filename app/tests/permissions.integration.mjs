@@ -7,6 +7,7 @@ import path from "node:path";
 import test from "node:test";
 import bcrypt from "bcryptjs";
 import pg from "pg";
+import { backupPaths } from "./helpers/backup-paths.mjs";
 
 assert.equal(process.env.API_TEST_ISOLATED, "1", "Use npm run test:api");
 const schema = "permissions_test";
@@ -76,9 +77,12 @@ test("stable-ID discovery and owner-only loading", { timeout: 60_000 }, async (t
 
   // Direct SQL only provisions disposable fixtures, including an ID above MAX_SAFE_INTEGER.
   const hash = await bcrypt.hash("fixture-password", 4);
+  const users = {};
+  const backups = backupPaths(directory, users);
   for (const [username, id] of [["alice", aliceId], ["bob", bobId], ["admin", null]]) {
     const user = await pool.query(`INSERT INTO ${schema}.users (username, password_hash)
-      VALUES ($1, $2) RETURNING id`, [username, hash]);
+      VALUES ($1, $2) RETURNING id, username`, [username, hash]);
+    users[username] = user.rows[0];
     if (id) {
       await pool.query(`INSERT INTO ${schema}.diagrams (id, user_id, name, scene_json)
         VALUES ($1, $2, 'same-name', $3::jsonb)`, [id, user.rows[0].id, JSON.stringify(scene)]);
@@ -100,7 +104,7 @@ test("stable-ID discovery and owner-only loading", { timeout: 60_000 }, async (t
   const bobFile = bobSaved.body.file;
   let aliceRevision = "2";
   const document = (id, file, revision = id === aliceId ? aliceRevision : "2") => ({ id, revision, ...file });
-  const backupPath = (username) => path.join(directory, username, "same-name.excalidraw.json");
+  const backupPath = (username) => backups.file(username, "same-name");
   const aliceBackup = await readFile(backupPath("alice"), "utf8");
   const bobBackup = await readFile(backupPath("bob"), "utf8");
   const unchanged = async () => {
