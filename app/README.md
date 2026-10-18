@@ -101,7 +101,7 @@ Clients may send exactly `{"type":"sync_request","payload":{}}` or
 same room receive that type/payload plus `sender:{userId,peerId}`: the exact account ID
 and a server-generated per-connection identity. There is no echo or cross-room delivery.
 Unknown fields/kinds, malformed/scalar JSON and binary data close with 1008
-(`No data protocol yet`). File messages remain unsupported.
+(`No data protocol yet`); binary WebSocket frames remain unsupported.
 
 Pointer messages use exactly `{"type":"pointer","payload":{"pointer":{"x":0,"y":-0.5,"tool":"pointer"},"button":"up"}}`.
 All shown keys are required; no extras are accepted at any of the three object levels.
@@ -111,6 +111,19 @@ is only `up` or `down`. The exact payload is relayed through the same authorizat
 with server-derived sender identity. Pointers are ephemeral; this adds no editor UI or storage.
 Scene records validate element identities, versions/nonces and deletion/updated metadata;
 optional index/fileId are string-or-null. Extensions, tombstones and order are preserved.
+
+File messages use exactly `{"type":"files","payload":{"files":{"image":{"id":"image","mimeType":"image/png","dataURL":"data:image/png;base64,AA==","created":0}}}}`.
+Envelope/payload keys are required with no extras; the file map may be empty. Each own
+nonempty map key must equal its record's required `id`; records also require `mimeType`,
+`dataURL` and finite nonnegative `created`. MIME is one of image/svg+xml, image/png,
+image/jpeg, image/gif, image/webp, image/bmp, image/x-icon, image/avif, image/jfif or
+application/octet-stream. A dataURL must start with lowercase `data:` and that exact MIME,
+then optional semicolon header parameters, a comma and a nonempty opaque body.
+Optional `lastRetrieved` is finite/nonnegative; optional `version` is a positive safe integer.
+Other JSON record metadata and exact dataURL bytes are preserved, not transport authority.
+Files use the same ephemeral relay: no decoding, sanitization, media-safety guarantee,
+cache/storage, scene-reference filtering or file-deletion protocol; tombstones remain scenes.
+
 Compression is disabled. Input (including fragmented messages) and encoded output are
 capped at 25 MiB; oversize input or encoded output closes with 1009. Each sender has at most eight pending
 messages/25 MiB, excluding in-flight work. Queue overflow or recipient buffered output

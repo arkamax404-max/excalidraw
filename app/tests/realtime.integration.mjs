@@ -418,3 +418,97 @@ test("pointer carriage preserves exact private ephemeral coordinates", { timeout
     send(raw + " "); await closed(a, 1009); b.send("unsupported"); await closed(b, 1008);
   }));
 });
+
+const fileRecord = { id: "unreferenced/é", mimeType: "image/png", dataURL: "data:image/png;base64,AA==", created: 0 };
+const filesPacket = (files) => ({ type: "files", payload: { files } });
+const filePacket = (record) => filesPacket({ [record.id]: record });
+const files = filePacket(fileRecord);
+const filesFixture = (t, body) => syncFixture(t, async (context) => {
+  await relay(context.a, context.b, context.f.users.owner, files, files); // Fast baseline close1008 BEFORE any file barrier.
+  await body(context);
+}, { maxFrameBytes: limit });
+
+test("file carriage preserves exact private binary records without persistence", { timeout: 480_000 }, async (t) => {
+  // Installed IMAGE_MIME_TYPES plus MIME_TYPES.binary; no decoder or media-safety oracle.
+  for (const mimeType of ["image/svg+xml", "image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp", "image/x-icon", "image/avif", "image/jfif", "application/octet-stream"]) {
+    await t.test(`bidirectional ${mimeType}, exact bytes, identity, no echo or cross-room frames`, (t) => filesFixture(t, async ({ f, a, b, c, d }) => {
+      const value = filePacket({ ...fileRecord, mimeType, dataURL: `data:${mimeType};charset=utf-8;custom=literal,é%00/+=\nuntouched` });
+      await relay(a, b, f.users.owner, value, value); await relay(b, a, f.users.member, value, value);
+      await relay(b, a, f.users.member, value, value); assert.notEqual(identities.get(a), identities.get(b));
+      for (const peer of [a, b, c, d]) { peer.send("unsupported"); await closed(peer, 1008, "No data protocol yet"); }
+    }));
+  }
+  await t.test("optional timestamps/version, finite extremes and arbitrary JSON metadata stay unchanged", (t) => filesFixture(t, async ({ f, a, b }) => {
+    for (const created of [0, 0.125, Number.MIN_VALUE, Number.MAX_VALUE]) {
+      const value = filePacket({ ...fileRecord, created, lastRetrieved: created, version: Number.MAX_SAFE_INTEGER,
+        sender: "metadata-only", room: "not-routing", revision: 9, extension: { updatedAt: "literal-not-clock", createdAt: "unchanged", items: [null, true, { deleted: true }] } });
+      await relay(a, b, f.users.owner, value, value);
+    }
+    const plain = filePacket({ ...fileRecord, dataURL: "data:image/png,not-base64-or-decoded" });
+    await relay(b, a, f.users.member, plain, plain);
+    a.send("unsupported"); await closed(a, 1008); b.send("unsupported"); await closed(b, 1008);
+  }));
+  await t.test("empty map and multiple arbitrary own IDs need no scene references or digest format", (t) => filesFixture(t, async ({ f, a, b }) => {
+    for (const value of [filesPacket({}), filesPacket(Object.fromEntries(["__proto__", "constructor", " ", "deleted-image"].map((id) => [id, { ...fileRecord, id }])))]) {
+      await relay(a, b, f.users.owner, value, value);
+    }
+    a.send("unsupported"); await closed(a, 1008); b.send("unsupported"); await closed(b, 1008);
+  }));
+  const invalid = [];
+  for (const [level, base, wrap] of [["envelope", files, (value) => value], ["payload", files.payload, (payload) => ({ ...files, payload })],
+    ["record", fileRecord, (record) => filesPacket({ [fileRecord.id]: record })]]) {
+    for (const key of Object.keys(base)) invalid.push([`${level} missing ${key}`, wrap(Object.fromEntries(Object.entries(base).filter(([name]) => name !== key)))]);
+    for (const value of [null, [], 1, "x", true]) invalid.push([`${level} rejects ${JSON.stringify(value)}`, wrap(value)]);
+    if (level !== "record") for (const key of ["sender", "userId", "peerId", "room", "session", "target", "token", "revision", "ETag", "unknown"]) {
+      invalid.push([`${level} forbids extra ${key}`, wrap({ ...base, [key]: "forged" })]);
+    }
+  }
+  for (const value of [null, [], 1, "x", true]) invalid.push([`file map rejects ${JSON.stringify(value)}`, filesPacket(value)]);
+  invalid.push(["empty map key", filesPacket({ "": { ...fileRecord, id: "" } })], ["map key/id mismatch", filesPacket({ different: fileRecord })]);
+  for (const [key, values] of [
+    ["id", ["", null, [], {}, 1, true]],
+    ["mimeType", ["image/PNG", "text/plain", "application/json", "", null, [], {}, 1, true]],
+    ["dataURL", [null, [], {}, 1, true, "", "data:image/jpeg,body", "data:IMAGE/PNG,body", "DATA:image/png,body", " data:image/png,body", "data:image/png", "data:image/png,", "data:image/png;base64,", "data:image/png-extra,body"]],
+    ...["created", "lastRetrieved"].map((key) => [key, [-1, -Number.MIN_VALUE, "0", null, [], {}, true]]),
+    ["version", [0, -1, 0.5, Number.MAX_SAFE_INTEGER + 1, "1", null, [], {}, true]],
+  ]) for (const value of values) invalid.push([`${key} rejects ${JSON.stringify(value)}`, filesPacket({ [fileRecord.id]: { ...fileRecord, [key]: value } })]);
+  for (const key of ["created", "lastRetrieved"]) for (const exponent of ["1e309", "-1e309"]) {
+    const value = filePacket({ ...fileRecord, lastRetrieved: 0 });
+    invalid.push([`${key} rejects raw ${exponent}`, JSON.stringify(value).replace(`"${key}":0`, `"${key}":${exponent}`)]);
+  }
+  for (const [name, value] of invalid) await t.test(name, (t) => filesFixture(t, async ({ a, b }) => {
+    a.send(value); await closed(a, 1008, "No data protocol yet"); b.send("unsupported"); await closed(b, 1008, "No data protocol yet");
+  }));
+  await t.test("quick actual dataURL bytes and metadata remain FIFO", (t) => filesFixture(t, async ({ f, a, b }) => {
+    const frames = [1, 2, 3].map((version) => filePacket({ ...fileRecord, dataURL: `data:image/png,é-frame-${version}`, version, extension: { updatedAt: `literal-${version}` } }));
+    for (const frame of frames) a.send(frame);
+    for (const frame of frames) {
+      const event = await b.next(); assert.equal(event.type, "message");
+      assert.deepEqual(JSON.parse(event.data), { ...frame, sender: { userId: String(f.users.owner), peerId: identities.get(a) } });
+    }
+    a.send("unsupported"); await closed(a, 1008); b.send("unsupported"); await closed(b, 1008);
+  }));
+  await t.test("file enqueue locks revocation before commit, then excludes stale recipient/sender while valid delivery continues", (t) => filesFixture(t, async ({ f, a, b, route, open, checkpoint }) => {
+    const gate = await f.realtimeGate();
+    try {
+      a.send(files); await gate.blocked;
+      const revoking = f.request(`${route}/members/member`, "owner", "DELETE"); revoking.catch(() => {});
+      await f.blocked(1); gate.release();
+      const event = await b.next(); assert.equal(event.type, "message");
+      assert.deepEqual(JSON.parse(event.data), { ...files, sender: { userId: String(f.users.owner), peerId: identities.get(a) } });
+      assert.equal((await revoking).status, 200); await checkpoint(); // Only intentional public ACL effects advance the snapshot.
+      const valid = await open("owner"); await relay(a, valid, f.users.owner, files, files);
+      if (b.open) b.send(files); await closed(b, 1008); // Any stale-recipient data before denial fails.
+      for (const peer of [a, valid]) { peer.send("unsupported"); await closed(peer, 1008); }
+    } finally { gate.release(); }
+  }));
+  await t.test("actual file encoded output exactly25MiB passes; +1 UTF-8 byte below input cap closes1009 without delivery", (t) => filesFixture(t, async ({ f, a, b }) => {
+    const value = structuredClone(files), record = value.payload.files[fileRecord.id];
+    const encoded = () => JSON.stringify({ ...value, sender: { userId: String(f.users.owner), peerId: identities.get(a) } });
+    const remaining = limit - Buffer.byteLength(encoded()); record.dataURL += "é".repeat(Math.floor(remaining / 2)) + "x".repeat(remaining % 2);
+    assert.equal(Buffer.byteLength(encoded()), limit); assert.ok(Buffer.byteLength(JSON.stringify(value)) < limit);
+    await relay(a, b, f.users.owner, value, value);
+    record.dataURL += "x"; assert.equal(Buffer.byteLength(encoded()), limit + 1); assert.ok(Buffer.byteLength(JSON.stringify(value)) < limit);
+    a.send(value); await closed(a, 1009); b.send("unsupported"); await closed(b, 1008);
+  }));
+});

@@ -21,6 +21,25 @@ const validPointer = (payload) => {
     ["pointer", "laser"].includes(pointer.tool);
 };
 
+// Installed IMAGE_MIME_TYPES plus MIME_TYPES.binary, without importing the browser bundle.
+const fileMimeTypes = new Set(["image/svg+xml", "image/png", "image/jpeg", "image/gif", "image/webp",
+  "image/bmp", "image/x-icon", "image/avif", "image/jfif", "application/octet-stream"]);
+const validFile = (id, file) => {
+  if (file === null || typeof file !== "object" || Array.isArray(file) || id.length === 0 || file.id !== id ||
+      !fileMimeTypes.has(file.mimeType) || typeof file.dataURL !== "string" ||
+      !Number.isFinite(file.created) || file.created < 0) return false;
+  if (Object.hasOwn(file, "lastRetrieved") && (!Number.isFinite(file.lastRetrieved) || file.lastRetrieved < 0)) return false;
+  if (Object.hasOwn(file, "version") && (!Number.isSafeInteger(file.version) || file.version <= 0)) return false;
+  const comma = file.dataURL.indexOf(",");
+  if (comma < 0 || comma === file.dataURL.length - 1) return false;
+  const header = file.dataURL.slice(0, comma), mimeHeader = `data:${file.mimeType}`;
+  // Header boundary is exact; the nonempty body is opaque, including literal newlines.
+  return header === mimeHeader || header.startsWith(`${mimeHeader};`);
+};
+const validFiles = (payload) => Object.keys(payload).length === 1 && payload.files !== null &&
+  typeof payload.files === "object" && !Array.isArray(payload.files) &&
+  Object.entries(payload.files).every(([id, file]) => validFile(id, file));
+
 const sameOrigin = (request, trustProxy) => {
   const origin = request.headers.origin;
   const host = request.headers.host;
@@ -112,6 +131,7 @@ export const attachRealtime = (server, { sessionMiddleware, pool, schema, sessio
             !value.payload || typeof value.payload !== "object" || Array.isArray(value.payload) ||
             !(value.type === "sync_request" ? Object.keys(value.payload).length === 0 :
               value.type === "pointer" ? validPointer(value.payload) :
+              value.type === "files" ? validFiles(value.payload) :
               value.type === "scene" && Object.keys(value.payload).length === 1 &&
               Array.isArray(value.payload.elements) && value.payload.elements.every(validElement))) return close(peer, 1008, "No data protocol yet");
         const frame = JSON.stringify({ type: value.type, sender: { userId: peer.actor, peerId: peer.peerId }, payload: value.payload });
