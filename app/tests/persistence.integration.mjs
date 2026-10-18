@@ -455,3 +455,154 @@ test("diagram deletion orders canonical changes and backup completion", { timeou
     await assertDeleted(id);
   });
 });
+
+test("owner deletion excludes stored-owner operations through filesystem completion", { timeout: 60_000 }, async (t) => {
+  for (const mode of ["legacy", "member-ID", "diagram-delete"]) {
+    await t.test(mode, async (t) => {
+      const f = await persistenceFixture(t);
+      const { request } = f;
+      const url = "/api/files/shared";
+      const first = await request(url, "owner", "PUT", scene);
+      const id = first.etag.slice(1).split(":")[0];
+      await request(`/api/diagrams/${id}/members`, "owner", "POST", { username: "member" });
+      await request(url, "stranger", "PUT", scene);
+      const other = await request(url, "stranger");
+      const barrier = await f.storageBarrier(mode === "diagram-delete" ? "unlink" : "writeFile",
+        "owner/shared.excalidraw.json");
+      const operation = mode === "diagram-delete" ? request(url, "owner", "DELETE")
+        : request(mode === "legacy" ? url : `/api/diagrams/${id}`,
+          mode === "legacy" ? "owner" : "member", "PUT", { elements: [{ id: mode }] },
+          { "If-Match": first.etag });
+      await barrier.blocked;
+      // Different documents can proceed under shared directory coordination.
+      assert.equal((await request("/api/files/independent", "owner", "PUT", scene)).status, 200);
+      const deleting = request(`/api/admin/users/${f.users.owner}`, "admin", "DELETE");
+      try {
+        await f.blocked(1);
+        expect(await request(url, "stranger"), 200, other.body);
+      } finally {
+        barrier.release();
+        await Promise.all([operation, deleting]);
+      }
+      assert.equal((await operation).status, 200);
+      expect(await deleting, 200, { ok: true, user: { id: f.users.owner, username: "owner" } });
+      expect(await request(`/api/diagrams/${id}`, "member"), 404,
+        { error: "El diagrama solicitado no existe." });
+      expect(await request("/api/diagrams", "member"), 200, { diagrams: [] });
+      expect(await request(`/api/diagrams/${id}/members`, "owner"), 404,
+        { error: "El diagrama solicitado no existe." });
+      const accounts = await request("/api/admin/users", "admin");
+      assert.ok(accounts.body.users.some((user) => user.username === "member"));
+      assert.deepEqual((await f.snapshot(id, "shared")).backups,
+        { "stranger/shared.excalidraw.json": `${JSON.stringify(scene, null, 2)}\n` });
+      expect(await request(url, "stranger"), 200, other.body);
+    });
+  }
+});
+
+test("directory identity survives username reuse while old owner cleanup is pending", { timeout: 60_000 }, async (t) => {
+  const f = await persistenceFixture(t);
+  const { request } = f;
+  const url = "/api/files/shared";
+  const first = await request(url, "owner", "PUT", scene);
+  const id = first.etag.slice(1).split(":")[0];
+  await request(`/api/diagrams/${id}/members`, "owner", "POST", { username: "member" });
+  await request(url, "stranger", "PUT", scene);
+  const other = await request(url, "stranger");
+  const barrier = await f.storageBarrier("rm", "owner");
+  const unlock = await f.directoryLock();
+  const deleting = request(`/api/admin/users/${f.users.owner}`, "admin", "DELETE");
+  const pending = [];
+  let fresh;
+  let recreated;
+  try {
+    try {
+      await f.blocked(1);
+      pending.push(request(url, "owner", "PUT", scene, { "If-Match": first.etag }),
+        request(`/api/diagrams/${id}`, "member", "PUT", scene, { "If-Match": first.etag }),
+        request(url, "owner", "DELETE"));
+      await f.blocked(4);
+    } finally { await unlock(); }
+    await barrier.blocked;
+    expect(await request(`/api/diagrams/${id}`, "member"), 404,
+      { error: "El diagrama solicitado no existe." });
+    expect(await request("/api/diagrams", "member"), 200, { diagrams: [] });
+    recreated = await request("/api/admin/users", "admin", "POST",
+      { username: "owner", password: "fixture-password" });
+    assert.equal(recreated.status, 201);
+    assert.notEqual(recreated.body.user.id, f.users.owner);
+    await f.loginAs("new-owner", "owner");
+    fresh = request(url, "new-owner", "PUT", { elements: [{ id: "new-account" }] });
+    await f.blocked(4);
+    expect(await request(url, "new-owner"), 404, { error: "El diagrama solicitado no existe." });
+    // Another directory remains usable even while recursive cleanup is paused.
+    expect(await request(url, "stranger"), 200, other.body);
+  } finally {
+    barrier.release();
+    await Promise.all([deleting, ...pending, fresh]);
+  }
+  expect(await deleting, 200, { ok: true, user: { id: f.users.owner, username: "owner" } });
+  for (const result of await Promise.all(pending)) expect(result, 404,
+    { error: "El diagrama solicitado no existe." });
+  const saved = await fresh;
+  assert.equal(saved.status, 200);
+  assert.notEqual(saved.etag, first.etag);
+  const loaded = await request(url, "new-owner");
+  assert.equal(loaded.etag, saved.etag);
+  assert.deepEqual(loaded.body.scene, { elements: [{ id: "new-account" }] });
+  const before = await f.snapshot(id, "shared");
+  expect(await request(url, "owner", "PUT", scene), 404, { error: "El diagrama solicitado no existe." });
+  expect(await request(url, "owner", "DELETE"), 404, { error: "El diagrama solicitado no existe." });
+  expect(await request(`/api/diagrams/${id}`, "member", "PUT", scene, { "If-Match": first.etag }),
+    404, { error: "El diagrama solicitado no existe." });
+  assert.deepEqual(await f.snapshot(id, "shared"), before);
+  assert.deepEqual(before.backups, {
+    "owner/shared.excalidraw.json": `${JSON.stringify(loaded.body.scene, null, 2)}\n`,
+    "stranger/shared.excalidraw.json": `${JSON.stringify(scene, null, 2)}\n`,
+  });
+  expect(await request(`/api/diagrams/${saved.etag.slice(1).split(":")[0]}/members`, "new-owner"),
+    200, { members: [] });
+});
+
+test("owner SQL/cleanup faults retain existing contracts and release coordination", { timeout: 60_000 }, async (t) => {
+  const f = await persistenceFixture(t);
+  const { request } = f;
+  const url = `/api/admin/users/${f.users.owner}`;
+  const created = await request("/api/files/shared", "owner", "PUT", scene);
+  const id = created.etag.slice(1).split(":")[0];
+  await request(`/api/diagrams/${id}/members`, "owner", "POST", { username: "member" });
+  const before = await f.snapshot(id, "shared");
+  expect(await request(url, null, "DELETE"), 401, { error: "Necesitas iniciar sesion." });
+  expect(await request(url, "member", "DELETE"), 403, { error: "Necesitas permisos de administrador." });
+  expect(await request("/api/admin/users/invalid", "admin", "DELETE"), 400,
+    { error: "El identificador de usuario no es valido." });
+  assert.deepEqual(await f.snapshot(id, "shared"), before);
+  await f.setup(`CREATE FUNCTION fixture_schema.reject_owner() RETURNS trigger LANGUAGE plpgsql AS
+    $$ BEGIN RAISE EXCEPTION 'isolated owner fault'; END $$;
+    CREATE TRIGGER reject_owner BEFORE DELETE ON fixture_schema.users
+    FOR EACH ROW EXECUTE FUNCTION fixture_schema.reject_owner()`);
+  const internal = { error: "Se produjo un error interno en el servidor." };
+  expect(await request(url, "admin", "DELETE"), 500, internal);
+  assert.deepEqual(await f.snapshot(id, "shared"), before);
+  await f.setup("DROP TRIGGER reject_owner ON fixture_schema.users");
+  assert.equal((await request(`/api/diagrams/${id}`, "member", "PUT", scene,
+    { "If-Match": created.etag })).status, 200);
+  const barrier = await f.storageBarrier("rm", "owner", true);
+  const deleting = request(url, "admin", "DELETE");
+  await barrier.blocked;
+  barrier.release();
+  const failed = await deleting;
+  expect(failed, 500, internal);
+  assert.equal(failed.warning, null);
+  expect(await request(url, "admin", "DELETE"), 404, { error: "El usuario solicitado no existe." });
+  expect(await request(`/api/diagrams/${id}`, "member"), 404, { error: "El diagrama solicitado no existe." });
+  expect(await request("/api/diagrams", "member"), 200, { diagrams: [] });
+  assert.deepEqual((await f.snapshot(id, "shared")).backups, before.backups);
+  const recreated = await request("/api/admin/users", "admin", "POST",
+    { username: "owner", password: "fixture-password" });
+  assert.equal(recreated.status, 201);
+  await f.loginAs("new-owner", "owner");
+  assert.equal((await request("/api/files/shared", "new-owner", "PUT", scene)).status, 200);
+  assert.equal((await request(`/api/admin/users/${recreated.body.user.id}`, "admin", "DELETE")).status, 200);
+  assert.deepEqual((await f.snapshot(id, "shared")).backups, {});
+});

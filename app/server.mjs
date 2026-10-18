@@ -478,14 +478,29 @@ app.delete("/api/admin/users/:id", requireAdmin, async (request, response, next)
     return;
   }
 
+  let client;
+  let lockKey;
+  let destroy = false;
   try {
-    const result = await pool.query(
+    client = await pool.connect();
+    const initial = (await client.query(`SELECT username FROM ${DB_SCHEMA}.users WHERE id = $1`,
+      [userId])).rows[0];
+    if (!initial) {
+      response.status(404).json({ error: "El usuario solicitado no existe." });
+      return;
+    }
+    // The physical directory survives account IDs. Exclude even a recreated
+    // account's saves until this account's recursive cleanup has finished.
+    const key = directoryLockKey(initial.username);
+    await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [key]);
+    lockKey = key;
+    const result = await client.query(
       `
         DELETE FROM ${DB_SCHEMA}.users
-        WHERE id = $1
+        WHERE id = $1 AND username = $2
         RETURNING id, username
       `,
-      [userId],
+      [userId, initial.username],
     );
 
     if (result.rowCount === 0) {
@@ -503,7 +518,14 @@ app.delete("/api/admin/users/:id", requireAdmin, async (request, response, next)
       },
     });
   } catch (error) {
+    destroy = true;
     next(error);
+  } finally {
+    if (lockKey && !destroy) {
+      try { await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [lockKey]); }
+      catch (error) { destroy = true; console.error("Owner directory unlock failed.", error); }
+    }
+    client?.release(destroy);
   }
 });
 
@@ -613,10 +635,14 @@ app.get("/api/diagrams/:id", requireAuth, async (request, response, next) => {
 
 const diagramLockKey = (ownerId, name) =>
   JSON.stringify([DB_SCHEMA, ownerId, sanitizeBaseName(name)]);
+const directoryLockKey = (username) =>
+  JSON.stringify(["directory", path.join(DATA_DIR, sanitizeBaseName(username))]);
 
-// Saves and diagram deletion hold the same session lock through filesystem completion.
+// Shared directory BEFORE document; owner deletion holds the directory exclusively.
+// Session locks span canonical commit and filesystem completion, including username reuse.
 const replaceDiagram = async ({ id, name }, userId, match, scene) => {
   const client = await pool.connect();
+  let directoryKey;
   let lockKey;
   let transaction = false;
   let destroy = false;
@@ -634,6 +660,9 @@ const replaceDiagram = async ({ id, name }, userId, match, scene) => {
       : (await client.query(`SELECT id AS user_id, username, $2::text AS name
           FROM ${DB_SCHEMA}.users WHERE id = $1 AND is_active`, target)).rows[0];
     if (!initial) return reject(404, "El diagrama solicitado no existe.");
+    const directory = directoryLockKey(initial.username);
+    await client.query("SELECT pg_advisory_lock_shared(hashtextextended($1, 0))", [directory]);
+    directoryKey = directory;
     const key = diagramLockKey(initial.user_id, initial.name);
     await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [key]);
     lockKey = key;
@@ -643,7 +672,8 @@ const replaceDiagram = async ({ id, name }, userId, match, scene) => {
     const owner = current ?? (name === undefined ? null : (await client.query(
       `SELECT id AS user_id, username, $2::text AS name FROM ${DB_SCHEMA}.users
        WHERE id = $1 AND is_active`, target)).rows[0]);
-    if (!owner || owner.user_id !== initial.user_id || owner.name !== initial.name) {
+    if (!owner || owner.user_id !== initial.user_id || owner.name !== initial.name
+      || owner.username !== initial.username) {
       return reject(404, "El diagrama solicitado no existe.");
     }
     if (match !== undefined) {
@@ -700,6 +730,10 @@ const replaceDiagram = async ({ id, name }, userId, match, scene) => {
     if (lockKey && !destroy) {
       try { await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [lockKey]); }
       catch (error) { destroy = true; console.error("Diagram unlock failed.", error); }
+    }
+    if (directoryKey && !destroy) {
+      try { await client.query("SELECT pg_advisory_unlock_shared(hashtextextended($1, 0))", [directoryKey]); }
+      catch (error) { destroy = true; console.error("Diagram directory unlock failed.", error); }
     }
     client.release(destroy);
   }
@@ -865,11 +899,21 @@ app.put("/api/files/:name", requireAuth, async (request, response, next) => {
 
 app.delete("/api/files/:name", requireAuth, async (request, response, next) => {
   let client;
+  let directoryKey;
   let lockKey;
   let destroy = false;
   try {
     const name = sanitizeBaseName(request.params.name);
     client = await pool.connect();
+    const initial = (await client.query(`SELECT username FROM ${DB_SCHEMA}.users WHERE id = $1`,
+      [request.session.user.id])).rows[0];
+    if (!initial) {
+      response.status(404).json({ error: "El diagrama solicitado no existe." });
+      return;
+    }
+    const directory = directoryLockKey(initial.username);
+    await client.query("SELECT pg_advisory_lock_shared(hashtextextended($1, 0))", [directory]);
+    directoryKey = directory;
     const key = diagramLockKey(request.session.user.id, name);
     await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [key]);
     lockKey = key;
@@ -880,9 +924,10 @@ app.delete("/api/files/:name", requireAuth, async (request, response, next) => {
         DELETE FROM ${DB_SCHEMA}.diagrams AS diagrams
         USING ${DB_SCHEMA}.users AS owner
         WHERE diagrams.user_id = $1 AND diagrams.name = $2 AND owner.id = diagrams.user_id
+          AND owner.username = $3
         RETURNING diagrams.name, owner.username
       `,
-      [request.session.user.id, name],
+      [request.session.user.id, name, initial.username],
     );
 
     if (result.rowCount === 0) {
@@ -906,6 +951,10 @@ app.delete("/api/files/:name", requireAuth, async (request, response, next) => {
     if (lockKey && !destroy) {
       try { await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [lockKey]); }
       catch (error) { destroy = true; console.error("Diagram deletion unlock failed.", error); }
+    }
+    if (directoryKey && !destroy) {
+      try { await client.query("SELECT pg_advisory_unlock_shared(hashtextextended($1, 0))", [directoryKey]); }
+      catch (error) { destroy = true; console.error("Diagram deletion directory unlock failed.", error); }
     }
     client?.release(destroy);
   }

@@ -149,9 +149,8 @@ later creates; IDs are not gapless.
 
 Legacy backup-only failures now use the canonical-success warning described below,
 without changing the normal success JSON shape. GET/list/membership routes remain
-unchanged. Diagram deletion coordination is described below; owner-directory
-coordination remains deferred to T3d1. No cross-resource atomicity or crash durability
-is promised.
+unchanged. Diagram and owner-directory deletion coordination is described below.
+No cross-resource atomicity or crash durability is promised.
 
 ### Ordered diagram deletion (T3d0)
 
@@ -167,8 +166,34 @@ backup is ignored; other cleanup failures return the existing generic HTTP 500
 This is not PUT's canonical-success warning contract. Failed cleanup may leave a
 stale backup; no automatic repair, archive or filesystem durability is promised.
 The isolated tests exercise backup-window barriers, observed PostgreSQL blocking,
-SQL/cleanup failures and subsequent operation. **Owner-account deletion and directory
-cleanup are not yet coordinated (T3d1); do not deploy this intermediate closure.**
+SQL/cleanup failures and subsequent operation.
+
+### Ordered owner cleanup (T3d1 candidate)
+
+Both save routes and diagram DELETE acquire a shared PostgreSQL session lock on the
+actual normalized owner-directory path **before** their document lock. Owner-account
+DELETE takes that directory exclusively through the canonical cascade and recursive
+cleanup. Different directories and ordinary different-document operations can proceed
+independently. Member saves use the stored owner's directory, not the member's.
+
+Directory identity does not depend on account ID: a newly recreated username's saves
+wait for old cleanup to finish. Waiting old sessions/diagram IDs are revalidated and
+cannot recreate deleted ownership or inherit membership. Account creation/reuse policy
+and directory/name normalization are unchanged.
+
+Owner DELETE still commits its cascade before cleanup. Cleanup failure returns the
+existing generic HTTP 500, with the account/shared diagrams already deleted and
+possible leftover backups; it does not return PUT's backup warning or undo the cascade.
+There is no filesystem crash-durability, repair queue, archive or cross-resource atomicity
+promise. Independent verification passed for this scoped coordination repair.
+**This candidate is not deployment approval.**
+
+Two pre-existing defects remain outside this repair. Accepted distinct usernames
+such as `Foo` and `foo` can map to the same backup directory; deleting one can
+remove the other's backups. Directory coordination does not establish universal
+cross-account backup isolation. Administrator self-deletion also currently returns
+200 because its identity comparison mixes string and numeric IDs. Neither behavior
+was changed; storage-layout or deletion-policy repairs require separate authorization.
 
 ### Frontend guarded saves (T3c1 candidate)
 
@@ -220,8 +245,9 @@ and private-file boundaries.
 
 This repairs future saves only: it cannot recover binary files or deleted elements
 already omitted from stored scenes. T3c2's scoped persistence assurance is verified.
-T3d deletion coordination, realtime and collaboration UI remain unfinished; this
-candidate does not authorize deployment.
+Scoped T3d1 deletion coordination passed independent verification. The pre-existing
+backup-directory collision and administrator self-deletion defects above remain;
+realtime and collaboration UI are unfinished. Deployment is not authorized.
 
 ### Guarded stable-ID replacement (T3b)
 

@@ -11,7 +11,7 @@ process.on("message", (message) => {
     release?.();
   }
 });
-for (const operation of ["writeFile", "unlink"]) {
+for (const operation of ["writeFile", "unlink", "rm"]) {
   const original = fs[operation];
   fs[operation] = async (...args) => {
     if (armed?.operation === operation && String(args[0]) === armed.path) {

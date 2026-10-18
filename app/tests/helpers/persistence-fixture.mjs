@@ -122,5 +122,20 @@ export const persistenceFixture = async (t) => {
       client.release();
     };
   };
-  return { request, snapshot, setup, directory, users, storageBarrier, blocked, documentLock, logs: () => output };
+  const directoryLock = async () => {
+    const client = await pool.connect();
+    const key = JSON.stringify(["directory", path.join(directory, "owner")]);
+    await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [key]);
+    return async () => {
+      await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [key]);
+      client.release();
+    };
+  };
+  const loginAs = async (alias, username) => {
+    const login = await request("/api/auth/login", null, "POST", { username, password: "fixture-password" });
+    assert.equal(login.status, 200);
+    cookies[alias] = login.cookie;
+  };
+  return { request, snapshot, setup, directory, users, storageBarrier, blocked, documentLock,
+    directoryLock, loginAs, logs: () => output };
 };
