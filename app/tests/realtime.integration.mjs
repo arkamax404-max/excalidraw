@@ -333,3 +333,88 @@ test("scene carriage preserves private ordered JSON without persistence", { time
     send(raw + " "); await closed(a, 1009); b.send("unsupported"); await closed(b, 1008);
   }));
 });
+
+const pointerPacket = (x = 0, y = -0.5, tool = "pointer", button = "up") => ({ type: "pointer", payload: { pointer: { x, y, tool }, button } });
+const pointer = pointerPacket();
+const pointerFixture = (t, body) => syncFixture(t, async (context) => {
+  // Every leaf must hit actual pointer close1008 RED before arming any feature barrier.
+  await relay(context.a, context.b, context.f.users.owner, pointer, pointer);
+  await body(context);
+});
+
+test("pointer carriage preserves exact private ephemeral coordinates", { timeout: 240_000 }, async (t) => {
+  for (const tool of ["pointer", "laser"]) for (const button of ["up", "down"]) {
+    await t.test(`bidirectional ${tool}/${button}, stable identity, no echo or cross-room frames`, (t) => pointerFixture(t, async ({ f, a, b, c, d }) => {
+      const value = pointerPacket(-12.75, 0, tool, button);
+      await relay(a, b, f.users.owner, value, value);
+      await relay(b, a, f.users.member, value, value);
+      await relay(b, a, f.users.member, value, value);
+      assert.notEqual(identities.get(a), identities.get(b));
+      for (const peer of [a, b, c, d]) { peer.send("unsupported"); await closed(peer, 1008, "No data protocol yet"); }
+    }));
+  }
+  await t.test("finite coordinate extremes, zero and fractions have no viewport or integer bounds", (t) => pointerFixture(t, async ({ f, a, b }) => {
+    for (const [x, y] of [[Number.MAX_VALUE, -Number.MAX_VALUE], [-Number.MAX_VALUE, Number.MAX_VALUE], [0, 0], [-0.125, Number.MIN_VALUE]]) {
+      const value = pointerPacket(x, y); await relay(a, b, f.users.owner, value, value);
+    }
+    a.send("unsupported"); await closed(a, 1008); b.send("unsupported"); await closed(b, 1008);
+  }));
+  const invalid = [];
+  for (const [level, base, wrap] of [
+    ["envelope", pointer, (value) => value],
+    ["payload", pointer.payload, (payload) => ({ ...pointer, payload })],
+    ["coordinates", pointer.payload.pointer, (value) => ({ ...pointer, payload: { ...pointer.payload, pointer: value } })],
+  ]) {
+    for (const key of Object.keys(base)) invalid.push([`${level} missing ${key}`, wrap(Object.fromEntries(Object.entries(base).filter(([name]) => name !== key)))]);
+    for (const value of [null, [], 1, "x", true]) invalid.push([`${level} rejects ${JSON.stringify(value)}`, wrap(value)]);
+    for (const key of ["pointersMap", "identity", "userId", "peerId", "sender", "room", "session", "target", "revision", "ETag", "selection", "appearance", "unknown"]) {
+      invalid.push([`${level} forbids extra ${key}`, wrap({ ...base, [key]: "forged" })]);
+    }
+  }
+  for (const key of ["x", "y", "tool", "button", "type"]) {
+    const values = key === "x" || key === "y" ? [null, [], {}, true, "0"] : [null, [], {}, true, 1, "", "POINTER", "other"];
+    for (const value of values) {
+      const packet = structuredClone(pointer);
+      if (key === "type") packet.type = value;
+      else if (key === "button") packet.payload.button = value;
+      else packet.payload.pointer[key] = value;
+      invalid.push([`${key} rejects ${JSON.stringify(value)}`, packet]);
+    }
+  }
+  for (const key of ["x", "y"]) for (const exponent of ["1e309", "-1e309"]) {
+    invalid.push([`${key} rejects raw ${exponent}`, JSON.stringify(pointer).replace(key === "x" ? '"x":0' : '"y":-0.5', `"${key}":${exponent}`)]);
+  }
+  for (const [name, value] of invalid) await t.test(name, (t) => pointerFixture(t, async ({ a, b }) => {
+    a.send(value); await closed(a, 1008, "No data protocol yet");
+    b.send("unsupported"); await closed(b, 1008, "No data protocol yet");
+  }));
+  await t.test("quick distinguishable coordinates and buttons remain FIFO", (t) => pointerFixture(t, async ({ f, a, b }) => {
+    const frames = [pointerPacket(1, -1, "laser", "down"), pointerPacket(2.5, 3, "pointer", "up"), pointerPacket(-4, 0, "laser", "up")];
+    for (const frame of frames) a.send(frame);
+    for (const frame of frames) {
+      const event = await b.next(); assert.equal(event.type, "message");
+      assert.deepEqual(JSON.parse(event.data), { ...frame, sender: { userId: String(f.users.owner), peerId: identities.get(a) } });
+    }
+    a.send("unsupported"); await closed(a, 1008); b.send("unsupported"); await closed(b, 1008);
+  }));
+  await t.test("pointer enqueue locks revocation before commit, then excludes stale recipient and sender", (t) => pointerFixture(t, async ({ f, a, b, route, open, checkpoint }) => {
+    const gate = await f.realtimeGate();
+    try {
+      a.send(pointer); await gate.blocked;
+      const revoking = f.request(`${route}/members/member`, "owner", "DELETE"); revoking.catch(() => {});
+      await f.blocked(1); gate.release();
+      const event = await b.next(); assert.equal(event.type, "message");
+      assert.deepEqual(JSON.parse(event.data), { ...pointer, sender: { userId: String(f.users.owner), peerId: identities.get(a) } });
+      assert.equal((await revoking).status, 200); await checkpoint(); // Only intentional public ACL effects advance the snapshot.
+      const valid = await open("owner"); await relay(a, valid, f.users.owner, pointer, pointer);
+      if (b.open) b.send(pointer); await closed(b, 1008); // Any stale-recipient data before denial fails.
+      for (const peer of [a, valid]) { peer.send("unsupported"); await closed(peer, 1008); }
+    } finally { gate.release(); }
+  }));
+  for (const fragmented of [false, true]) await t.test(`pointer raw input25MiB/+1, fragmented=${fragmented}`, (t) => pointerFixture(t, async ({ f, a, b }) => {
+    const raw = JSON.stringify(pointer).padEnd(limit, " ");
+    const send = (text) => fragmented ? (a.send(text.slice(0, limit / 2), { fin: false }), a.send(text.slice(limit / 2), { fin: true })) : a.send(text);
+    await relay(a, b, f.users.owner, () => send(raw), pointer);
+    send(raw + " "); await closed(a, 1009); b.send("unsupported"); await closed(b, 1008);
+  }));
+});

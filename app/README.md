@@ -101,7 +101,14 @@ Clients may send exactly `{"type":"sync_request","payload":{}}` or
 same room receive that type/payload plus `sender:{userId,peerId}`: the exact account ID
 and a server-generated per-connection identity. There is no echo or cross-room delivery.
 Unknown fields/kinds, malformed/scalar JSON and binary data close with 1008
-(`No data protocol yet`). Pointer and file messages remain unsupported.
+(`No data protocol yet`). File messages remain unsupported.
+
+Pointer messages use exactly `{"type":"pointer","payload":{"pointer":{"x":0,"y":-0.5,"tool":"pointer"},"button":"up"}}`.
+All shown keys are required; no extras are accepted at any of the three object levels.
+Coordinates must be finite numbers, including zero, negatives, fractions and ±`Number.MAX_VALUE`;
+there are no integer or viewport bounds. `tool` is only `pointer` or `laser`, and `button`
+is only `up` or `down`. The exact payload is relayed through the same authorization gate
+with server-derived sender identity. Pointers are ephemeral; this adds no editor UI or storage.
 Scene records validate element identities, versions/nonces and deletion/updated metadata;
 optional index/fileId are string-or-null. Extensions, tombstones and order are preserved.
 Compression is disabled. Input (including fragmented messages) and encoded output are

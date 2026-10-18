@@ -13,6 +13,14 @@ const validElement = (element) => element !== null && typeof element === "object
   ["index", "fileId"].every((key) => !Object.hasOwn(element, key) ||
     element[key] === null || typeof element[key] === "string");
 
+const validPointer = (payload) => {
+  const pointer = payload.pointer;
+  return Object.keys(payload).length === 2 && ["up", "down"].includes(payload.button) &&
+    pointer !== null && typeof pointer === "object" && !Array.isArray(pointer) &&
+    Object.keys(pointer).length === 3 && Number.isFinite(pointer.x) && Number.isFinite(pointer.y) &&
+    ["pointer", "laser"].includes(pointer.tool);
+};
+
 const sameOrigin = (request, trustProxy) => {
   const origin = request.headers.origin;
   const host = request.headers.host;
@@ -103,6 +111,7 @@ export const attachRealtime = (server, { sessionMiddleware, pool, schema, sessio
         if (binary || !value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length !== 2 ||
             !value.payload || typeof value.payload !== "object" || Array.isArray(value.payload) ||
             !(value.type === "sync_request" ? Object.keys(value.payload).length === 0 :
+              value.type === "pointer" ? validPointer(value.payload) :
               value.type === "scene" && Object.keys(value.payload).length === 1 &&
               Array.isArray(value.payload.elements) && value.payload.elements.every(validElement))) return close(peer, 1008, "No data protocol yet");
         const frame = JSON.stringify({ type: value.type, sender: { userId: peer.actor, peerId: peer.peerId }, payload: value.payload });
