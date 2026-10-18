@@ -46,4 +46,4 @@ docker run --name "$runner" --network "$network" \
   -e API_TEST_ISOLATED=1 -e PGHOST="$database" \
   -e PGPORT=5432 -e PGUSER=postgres -e PGDATABASE=postgres \
   -e PGPASSWORD=isolated-api-test \
-  node:22-alpine node --test --test-concurrency=1 tests/api.integration.mjs tests/permissions.integration.mjs tests/membership.integration.mjs tests/revisions.integration.mjs
+  node:22-alpine node --test --test-concurrency=1 tests/api.integration.mjs tests/permissions.integration.mjs tests/membership.integration.mjs tests/revisions.integration.mjs tests/persistence.integration.mjs

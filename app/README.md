@@ -49,6 +49,12 @@ Database access is used only to provision fixtures; behavior is checked through
 HTTP and backup files. `npm test` remains the fast suite without Docker. Running
 the integration file directly is intentionally rejected: use the isolated runner.
 
+`tests/helpers/persistence-fixture.mjs` supplies isolated accounts, real HTTP requests
+and public-state/backup snapshots for `tests/persistence.integration.mjs`. These
+regressions pin legacy raw-scene writes, revision tokens, shared reads and rejection
+non-effects. This test foundation adds no guarded save endpoint or lost-update
+protection; legacy replacements still accept writes without `If-Match`.
+
 ## HTTP API
 
 The server exposes the session cookie `excalidraw.sid`; every route below except the
