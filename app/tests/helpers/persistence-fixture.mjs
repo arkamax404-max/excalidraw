@@ -141,6 +141,19 @@ export const persistenceFixture = async (t, { seedData, realtime = false } = {})
     server.send({ realtime: "observe", now });
     return reply;
   };
+  let shutdownId = 0;
+  const realtimeShutdown = async (action) => {
+    assert.equal(realtime, true);
+    const token = ++shutdownId;
+    const response = (async () => {
+      for (;;) {
+        const [event] = await once(server, "message", { signal: AbortSignal.timeout(2000) });
+        if (event.shutdown === token) return event;
+      }
+    })();
+    server.send({ shutdown: action, token });
+    return response;
+  };
   let controlId = 0;
   const realtimeControl = async (action, options = {}) => {
     assert.equal(realtime, true);
@@ -202,6 +215,6 @@ export const persistenceFixture = async (t, { seedData, realtime = false } = {})
     accounts[alias] = login.body.user;
   };
   return { request, snapshot, setup, directory, users, storageBarrier, blocked, documentLock,
-    directoryLock, loginAs, backups, realtimeGate, realtimeObserve, realtimeControl,
+    directoryLock, loginAs, backups, realtimeGate, realtimeObserve, realtimeControl, realtimeShutdown,
     cookieFor: (user) => cookies[user], logs: () => output, streams: () => ({ stdout, stderr }) };
 };

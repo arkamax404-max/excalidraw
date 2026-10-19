@@ -5,6 +5,55 @@
 // Both sender and recipient stored identity/expiry must still match at enqueue.
 import pg from "pg";
 import WebSocket from "ws";
+import { Server } from "node:http";
+
+// Observe real realtime-owned timers, not unref status or active-handle visibility.
+const timers = new Map(), upgrades = [], closeEvents = [];
+let httpServer, finishClose;
+const httpClosed = new Promise((resolve) => { finishClose = resolve; });
+const timerCounts = { interval: 0, timeout: 0 };
+for (const [kind, setName, clearName] of [["interval", "setInterval", "clearInterval"], ["timeout", "setTimeout", "clearTimeout"]]) {
+  const schedule = globalThis[setName], clear = globalThis[clearName];
+  globalThis[setName] = function (callback, delay, ...args) {
+    if (!/\/realtime\.mjs:/.test(new Error().stack?.split("\n")[2] ?? "")) return schedule(callback, delay, ...args);
+    let timer;
+    const run = function (...values) {
+      if (kind === "timeout") timers.delete(timer);
+      return callback.apply(this, values);
+    };
+    timer = schedule(run, delay, ...args);
+    timers.set(timer, kind); timerCounts[kind]++;
+    return timer;
+  };
+  globalThis[clearName] = function (timer) { timers.delete(timer); return clear(timer); };
+}
+const listen = Server.prototype.listen;
+Server.prototype.listen = function (...args) {
+  httpServer = this;
+  this.prependListener("upgrade", (_request, socket) => {
+    const kinds = ["error", "timeout", "close"];
+    const before = kinds.map((kind) => socket.listeners(kind));
+    const record = { socket, listeners: [] }; upgrades.push(record);
+    queueMicrotask(() => { record.listeners = kinds.flatMap((kind, i) =>
+      socket.listeners(kind).filter((listener) => !before[i].includes(listener)).map((listener) => [kind, listener])); });
+  });
+  return listen.apply(this, args);
+};
+const shutdownState = () => ({ listening: httpServer.listening, closeEvents: [...closeEvents],
+  timers: [...timers.values()], timerCounts: { ...timerCounts },
+  upgrades: upgrades.map(({ socket, listeners }) => ({ destroyed: socket.destroyed,
+    listeners: listeners.filter(([kind, listener]) => socket.listeners(kind).includes(listener)).length })) });
+process.on("message", async (event) => {
+  if (!event.shutdown) return;
+  if (event.shutdown === "close") {
+    httpServer.once("close", () => { closeEvents.push("close"); finishClose(); });
+    const returned = httpServer.close((error) => { closeEvents.push(error?.code ?? "callback"); });
+    process.send({ shutdown: event.token, returnedServer: returned === httpServer, ...shutdownState() });
+  } else {
+    if (event.shutdown === "closed") await httpClosed;
+    process.send({ shutdown: event.token, ...shutdownState() });
+  }
+});
 
 let armed = false;
 let release;
@@ -50,7 +99,7 @@ pg.Client.prototype.query = async function (...args) {
 let fault, unblock, tracked, faultArmed = false;
 let consumed = 0, matches = 0, pending = 0, earlyRelease = 0, expectedError;
 const state = () => ({ consumed, matches, pending, earlyRelease, expectedError: expectedError && expectedError.stack + "\n",
-  queryDone: tracked?.queryDone, rollbackDone: tracked?.rollbackDone });
+  began: tracked?.began, queryDone: tracked?.queryDone, rollbackDone: tracked?.rollbackDone });
 const observed = () => process.send({ fault: fault.control, phase: "observed" });
 process.on("message", (event) => {
   if (event.control === undefined) return;
@@ -78,9 +127,10 @@ pg.Client.prototype.query = function (...args) {
     /SELECT sid, sess, EXTRACT/.test(sql) && values?.[0]?.includes(fault.sid);
   const mutation = fault && ((fault.mode === "logout-error" && /^DELETE FROM .*user_sessions/.test(sql) && values?.[0] === fault.sid) ||
     (fault.mode === "deactivate-error" && /UPDATE .*users\s+SET/s.test(sql) && String(values?.[0]) === fault.actor));
-  if (audit) matches++;
-  const selected = faultArmed && (audit || mutation) && !consumed;
-  if (selected) { consumed++; if (fault.mode === "query-stall") track(this, true); }
+  const upgrade = fault?.mode === "upgrade-stall" && /SELECT EXISTS/.test(sql) && String(values?.[0]) === fault.actor;
+  if (audit || upgrade) matches++;
+  const selected = faultArmed && (audit || mutation || upgrade) && !consumed;
+  if (selected) { consumed++; if (fault.mode === "query-stall" || upgrade) track(this, !upgrade); }
   const record = tracked?.client === this ? tracked : null;
   if (!selected && !record) return faultQuery.apply(this, args);
   const callback = typeof args.at(-1) === "function" ? args.pop() : args[0]?.callback;
@@ -89,13 +139,13 @@ pg.Client.prototype.query = function (...args) {
     if (record) { record.active++; if (/^BEGIN\b/.test(sql)) record.began = true; }
     try {
       if (selected) {
-        const stalled = fault.mode === "query-stall" ? hold() : null;
+        const stalled = ["query-stall", "upgrade-stall"].includes(fault.mode) ? hold() : null;
         observed();
         if (stalled) await stalled;
         else { const error = new Error(`isolated realtime ${fault.mode}`); expectedError = error; throw error; }
       }
       const result = await faultQuery.apply(this, args);
-      if (record && /SELECT sid, sess, EXTRACT/.test(sql)) record.queryDone = true;
+      if (record && /SELECT sid, sess, EXTRACT|SELECT EXISTS/.test(sql)) record.queryDone = true;
       if (record && /^ROLLBACK\b/.test(sql)) record.rollbackDone = true;
       return result;
     } finally { if (record) record.active--; }

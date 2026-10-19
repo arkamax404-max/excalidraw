@@ -69,6 +69,8 @@ export const attachRealtime = (server, { sessionMiddleware, pool, schema, sessio
   const limit = 25 * 1024 * 1024;
   const realtime = new WebSocketServer({ noServer: true, maxPayload: limit, perMessageDeflate: false });
   const peers = new Set();
+  const pending = new Set();
+  let stopped = false;
   const live = (peer) => peer.socket.readyState === 1;
   const close = (peer, code = 1008, reason = "Access denied") => {
     peer.queue.length = 0; peer.bytes = 0;
@@ -167,10 +169,13 @@ export const attachRealtime = (server, { sessionMiddleware, pool, schema, sessio
     finally { peer.busy = false; if (!live(peer)) { peer.queue.length = 0; peer.bytes = 0; } }
   };
   realtime.on("wsClientError", (_error, socket) => rejectUpgrade(socket, 400));
-  server.on("upgrade", (request, socket, head) => {
+  const upgrade = (request, socket, head) => {
+    if (stopped) return socket.destroy();
+    pending.add(socket);
     const onError = () => socket.destroy();
     const onTimeout = () => socket.destroy();
     const cleanup = () => {
+      pending.delete(socket);
       socket.off("error", onError).off("timeout", onTimeout).off("close", cleanup);
     };
     socket.on("error", onError).once("timeout", onTimeout).once("close", cleanup);
@@ -185,7 +190,7 @@ export const attachRealtime = (server, { sessionMiddleware, pool, schema, sessio
       await new Promise((resolve, reject) => {
         sessionMiddleware(request, {}, (error) => error ? reject(error) : resolve());
       });
-      if (socket.destroyed) return;
+      if (stopped || socket.destroyed) return;
       const actor = request.session?.user?.id;
       if (!canonicalId(actor)) return deny(401);
       const id = match[1];
@@ -197,7 +202,7 @@ export const attachRealtime = (server, { sessionMiddleware, pool, schema, sessio
           SELECT 1 FROM ${schema}.diagram_members WHERE diagram_id = diagrams.id AND user_id = actor.id
         ))) AS allowed FROM ${schema}.users AS actor WHERE actor.id = $1 AND actor.is_active`,
       [actor, canonicalId(id) ? id : null]);
-      if (socket.destroyed) return;
+      if (stopped || socket.destroyed) return;
       if (!access.rowCount) return deny(401);
       if (!canonicalId(id)) return deny(400);
       if (!access.rows[0].allowed) return deny(404);
@@ -231,5 +236,18 @@ export const attachRealtime = (server, { sessionMiddleware, pool, schema, sessio
       });
     };
     void authorize().catch(() => deny(500));
-  });
+  };
+  server.on("upgrade", upgrade);
+  const nativeClose = server.close;
+  server.close = function (...args) {
+    // Preserve native validation/throws, callback semantics and return value first.
+    const result = nativeClose.apply(this, args);
+    if (this !== server || stopped) return result;
+    stopped = true;
+    server.off("upgrade", upgrade);
+    for (const socket of pending) socket.destroy();
+    // Do not wait for the close event: upgraded transports can keep it pending.
+    for (const peer of peers) { clearInterval(peer.watchdog); close(peer); }
+    return result;
+  };
 };

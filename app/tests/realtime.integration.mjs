@@ -763,3 +763,68 @@ for (const mode of ["logout-error", "deactivate-error"])
     assert.deepEqual(await row(), stored);
     assert.equal(f.streams().stderr, status.expectedError, "only the exact intentional error stack is logged");
   }));
+
+// C1b: real native HTTP close, never synthetic close events or teardown as proof.
+import { pendingRealtimeUpgrade } from "./helpers/realtime-peer.mjs";
+for (const mode of ["query-stall", "pool-stall", "upgrade-stall"])
+  test(`real server shutdown: ${mode}`, { timeout: 20_000 }, async (t) => {
+    const f = await persistenceFixture(t, { realtime: true });
+    assert.equal((await f.request("/api/files/shutdown", "owner", "PUT", scene)).status, 200);
+    const id = (await f.request("/api/diagrams", "owner")).body.diagrams[0].id;
+    const peers = [];
+    let fault, raw;
+    try {
+      for (const acknowledgeClose of [true, false]) {
+        const peer = realtimePeer(id, f.cookieFor("owner"), { acknowledgeClose, deadlineMs: 1700,
+          deadlineMessage: "Realtime shutdown admitted transport did not retire" });
+        peers.push(peer);
+        assert.deepEqual(await peer.next(), { type: "message", binary: false,
+          data: Buffer.from(JSON.stringify({ type: "ready", diagramId: id })) });
+      }
+      await relay(peers[0], peers[1], f.users.owner);
+      await relay(peers[1], peers[0], f.users.owner);
+      const sid = decodeURIComponent(f.cookieFor("owner").split("=")[1]).slice(2).split(".")[0];
+      fault = await f.realtimeControl("arm", { mode, sid, actor: String(f.users.owner) });
+      if (mode === "upgrade-stall") raw = pendingRealtimeUpgrade(id, f.cookieFor("owner"));
+      assert.ok(await fault.observed, "existing query/acquisition fault reached before shutdown");
+      const before = await f.realtimeShutdown("status");
+      assert.equal(before.timers.filter((kind) => kind === "interval").length, 2);
+      const stopped = await f.realtimeShutdown("close");
+      assert.equal(stopped.returnedServer, true, "native close returns its HTTP server");
+      assert.equal(stopped.listening, false, "actual close stops listening synchronously");
+      if (raw) await raw.waitEnd(); // Baseline must fail this rule, not a future production marker.
+      const events = await Promise.all(peers.map((peer) => peer.next()));
+      for (const event of events) assert.deepEqual(event, { type: "close", code: 1008, reason: "Access denied" });
+      const { closeFrame, transportEnd } = peers[1].retirement;
+      assert.equal(typeof transportEnd, "number", "nonack remote TCP end before test teardown");
+      assert.ok(transportEnd - closeFrame.at <= 1200, "existing one-second termination grace");
+      const ended = await f.realtimeShutdown("closed");
+      assert.deepEqual(ended.closeEvents, ["close", "callback"], "real close event and native success callback");
+      assert.deepEqual(ended.timers, [], "realtime watchdogs and reapers actually removed");
+      assert.ok(ended.timerCounts.timeout > 0, "force-retirement reaper was actually scheduled");
+      if (raw) assert.equal(typeof raw.state().remoteEnd, "number");
+    } finally {
+      await f.realtimeControl("release"); // Disarm first; retain token/record until SQL and rollback settle.
+      try {
+        if (fault) {
+          const settled = await fault.settled;
+          assert.ok(settled, "pending work settles even after native HTTP close");
+          assert.equal(settled.pending, 0);
+          assert.equal(settled.earlyRelease, 0);
+          if (mode !== "pool-stall" || settled.began) assert.equal(settled.queryDone, true);
+          if (settled.began) assert.equal(settled.rollbackDone, true);
+          fault.cancel();
+        }
+        if (raw) {
+          assert.doesNotMatch(raw.state().response, /HTTP\/1\.1 101|"type":"ready"/, "no late admission after stop/release");
+          assert.deepEqual(raw.state().errors, []);
+          const state = await f.realtimeShutdown("status");
+          assert.ok(state.upgrades.every((socket) => socket.destroyed && socket.listeners === 0), "pending query socket listeners removed");
+        }
+        assert.equal(f.streams().stderr, "");
+      } finally {
+        fault?.cancel(); raw?.dispose();
+        await Promise.all(peers.map((peer) => peer.dispose()));
+      }
+    }
+  });

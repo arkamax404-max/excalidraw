@@ -1,8 +1,30 @@
 import WebSocket from "ws";
+import { connect } from "node:net";
 import { realtimeOrigin } from "./realtime-client.mjs";
 
+// A genuine HTTP Upgrade sent over TCP; only a remote end counts as retirement.
+export const pendingRealtimeUpgrade = (id, cookie) => {
+  const url = new URL(realtimeOrigin), chunks = [], errors = [];
+  let remoteEnd, resolveEnd;
+  const ended = new Promise((resolve) => { resolveEnd = resolve; });
+  const socket = connect(Number(url.port), url.hostname, () => socket.write(
+    `GET /api/realtime/diagrams/${id} HTTP/1.1\r\nHost: ${url.host}\r\nOrigin: ${realtimeOrigin}\r\n` +
+    `Cookie: ${cookie}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n` +
+    "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"));
+  socket.on("data", (chunk) => { chunks.push(chunk); if (Buffer.concat(chunks).length > 65536) socket.destroy(new Error("Upgrade capture overflow")); });
+  socket.on("error", (error) => errors.push(error.message));
+  socket.once("end", () => { remoteEnd = performance.now(); resolveEnd(); });
+  return { dispose: () => socket.destroy(), state: () => ({ remoteEnd, response: Buffer.concat(chunks).toString("utf8"), errors }),
+    waitEnd: async () => {
+      let timer;
+      try { await Promise.race([ended, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Realtime shutdown pending upgrade transport did not end")), 1700);
+      })]); } finally { clearTimeout(timer); }
+    } };
+};
+
 // One bounded event queue, including terminal events; no background promise chain.
-export const realtimePeer = (id, cookie, { compression = false, maxFrameBytes = 65536, deadlineMs = 3000, acknowledgeClose = true } = {}) => {
+export const realtimePeer = (id, cookie, { compression = false, maxFrameBytes = 65536, deadlineMs = 3000, acknowledgeClose = true, deadlineMessage } = {}) => {
   const socket = new WebSocket(`${realtimeOrigin.replace("http:", "ws:")}/api/realtime/diagrams/${id}`, {
     headers: { Cookie: cookie, Origin: realtimeOrigin },
     perMessageDeflate: compression, handshakeTimeout: 2000,
@@ -48,7 +70,7 @@ export const realtimePeer = (id, cookie, { compression = false, maxFrameBytes = 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         waiting = undefined;
-        reject(new Error(deadlineMs === 3000 ? "Realtime event deadline exceeded" : "Realtime idle close missing within safety deadline"));
+        reject(new Error(deadlineMessage ?? (deadlineMs === 3000 ? "Realtime event deadline exceeded" : "Realtime idle close missing within safety deadline")));
       }, deadlineMs);
       waiting = (event) => {
         clearTimeout(timer); waiting = undefined;

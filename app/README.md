@@ -144,7 +144,7 @@ Each peer has an independent 1s idle audit through that same authorization gate,
 Admission starts a monotonic 5s freshness cap; only timely positive authorization under the current row locks refreshes it.
 Stalled/unverifiable authorization closes with 1008 `Access denied` by the next tick (at most 6s), then forces termination after 1s grace.
 Thus transport retirement is bounded by 7s under a responsive event loop; closing drops queued/new messages without renewing WS sessions.
-Real HTTP-server shutdown/late-admission lifecycle remains C1b; canonical SQL-boundary invalidation and editor convergence remain T4d/T5–T6.
+Real HTTP-server close stops admission/audits, ends pending upgrades and retires peers with the same 1008/1s-grace policy; SQL-boundary invalidation/editor convergence remain T4d/T5–T6.
 HTTP remains the sole guarded scene/revision/ETag authority; there is no WS persistence,
 scene/file cache or backup change. API regressions cover real cookies, close boundaries,
 revocation overlap and canonical/account/membership/backup non-effects. Controlled buffer
@@ -155,8 +155,8 @@ No wire/data format, sender identity, HTTP canonical authority, revisions, files
 They require genuine ready/relay before idle invalidation, exact policy retirement,
 and independent-SID snapshot reads. Injected query/acquisition stalls hold JavaScript
 promises before SQL/pool acquisition; they do not simulate PG locks or TCP saturation.
-The nonacknowledging peer observes remote TCP end before teardown. Real server-close
-and late-upgrade lifecycle proof is deferred to C1b; SQL-before-cleanup invalidation to T4d.
+The nonacknowledging peer observes remote TCP end before teardown. C1b implements native-close retirement
+and late-admission exclusion; isolated API and baseline compatibility checks pass. SQL-before-cleanup invalidation remains T4d.
 
 ### Stable-ID reads
 
