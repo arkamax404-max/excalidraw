@@ -596,3 +596,170 @@ for (const renewal of [false, true]) test(`session boundary: ${renewal ? "HTTP r
     }
   }
 });
+
+
+// C1a only. Every subject proves ready+relay before an idle mutation/fault.
+const idleFixture = async (t, body, acknowledgeClose = true) => {
+  const f = await persistenceFixture(t, { realtime: true });
+  for (const [user, name] of [["owner", "shared"], ["owner", "second"], ["stranger", "shared"]])
+    assert.equal((await f.request(`/api/files/${name}`, user, "PUT", scene)).status, 200);
+  const rooms = (await f.request("/api/diagrams", "owner")).body.diagrams;
+  const id = rooms.find((room) => room.name === "shared").id, second = rooms.find((room) => room.name === "second").id;
+  const other = (await f.request("/api/diagrams", "stranger")).body.diagrams[0].id;
+  for (const room of [id, second]) assert.equal((await f.request(`/api/diagrams/${room}/members`, "owner", "POST", { username: "member" })).status, 201);
+  await f.loginAs("probe", "member"); await f.loginAs("probe2", "member"); await f.loginAs("arrival", "stranger");
+  const sid = (user) => decodeURIComponent(f.cookieFor(user).split("=")[1]).slice(2).split(".")[0];
+  const row = async (user = "probe") => (await f.setup("SELECT * FROM fixture_schema.user_sessions WHERE sid=$1", [sid(user)])).rows;
+  const snapshot = async () => ({ primary: await f.snapshot(id, "shared"),
+    secondary: await Promise.all(["owner", "member"].map((user) => f.request(`/api/diagrams/${second}`, user))),
+    other: await f.request(`/api/diagrams/${other}`, "stranger"), accounts: await f.request("/api/admin/users", "admin"),
+    members: await Promise.all([id, second].map((room) => f.request(`/api/diagrams/${room}/members`, "owner"))) });
+  let expected = await snapshot(), inactiveActor;
+  const checkpoint = async (actor, isActive, user, login = false) => {
+    const previous = expected.accounts.body.users.find((item) => item.id === f.users[actor]);
+    assert.deepEqual(user, { ...previous, diagramCount: 0, isActive, updatedAt: user.updatedAt, ...(login ? { lastLoginAt: user.lastLoginAt } : {}) });
+    expected.accounts.body.users = expected.accounts.body.users.map((item) => item.id === user.id ? { ...previous, isActive, updatedAt: user.updatedAt, lastLoginAt: user.lastLoginAt } : item);
+    const { default: responseETag } = await import("etag"); expected.accounts.etag = responseETag(JSON.stringify(expected.accounts.body), { weak: true });
+    if (!isActive) inactiveActor = actor;
+  };
+  const restore = async () => {
+    if (!inactiveActor) return;
+    const actor = inactiveActor;
+    const activate = async (login = false) => {
+      const result = await f.request(`/api/admin/users/${f.users[actor]}`, "admin", "PUT", { isActive: true });
+      assert.equal(result.status, 200); await checkpoint(actor, true, result.body.user, login);
+    };
+    await activate(); await f.loginAs("restored", actor); await activate(true);
+    for (const room of [id, second]) assert.deepEqual(await f.request(`/api/diagrams/${room}`, "restored"), { ...await f.request(`/api/diagrams/${room}`, actor), cookie: f.cookieFor("restored") });
+    inactiveActor = undefined;
+  };
+  const peers = [], roomOf = new WeakMap();
+  const open = async (user, room = id, ack = true) => {
+    const peer = realtimePeer(room, f.cookieFor(user), { deadlineMs: 7200, acknowledgeClose: ack }); peers.push(peer); roomOf.set(peer, room);
+    assert.deepEqual(await peer.next(), { type: "message", binary: false, data: Buffer.from(JSON.stringify({ type: "ready", diagramId: room })) });
+    return peer;
+  };
+  const fanout = async (sender, target, userId) => {
+    const recipients = peers.filter((peer) => peer !== sender && peer.open && roomOf.get(peer) === roomOf.get(sender));
+    assert.ok(recipients.includes(target));
+    const delivery = Promise.all(recipients.map((peer) => peer.next()));
+    try {
+      const result = Promise.race([delivery, sender.next(false).then(() => assert.fail("no sender echo"))]);
+      sender.send(sync);
+      const events = await result, frame = JSON.parse(events[0].data);
+      assert.equal(typeof frame.sender?.peerId, "string"); assert.ok(frame.sender.peerId.length > 0);
+      const peerId = identities.get(sender) ?? frame.sender.peerId; identities.set(sender, peerId);
+      for (const event of events) assert.deepEqual(event, { type: "message", binary: false,
+        data: Buffer.from(JSON.stringify({ type: sync.type, sender: { userId: String(userId), peerId }, payload: sync.payload })) });
+    } finally { sender.cancelRead(); recipients.forEach((peer) => peer.cancelRead()); }
+  };
+  try {
+    const a = await open("probe", id, acknowledgeClose), b = await open("owner");
+    await fanout(a, b, f.users.member); await fanout(b, a, f.users.owner);
+    await body({ f, a, b, id, second, other, open, sid, row, fanout, checkpoint, restore });
+    for (const peer of peers.filter((peer) => peer.open)) { peer.send("unsupported"); await closed(peer, 1008, "No data protocol yet"); }
+  } finally {
+    await restore(); // Also restore on baseline idle-rule failure, without masking it with inaccessible snapshots.
+    await f.realtimeControl("release");
+    try { await Promise.all(peers.map((peer) => peer.dispose())); }
+    finally { assert.deepEqual(await snapshot(), expected); }
+  }
+};
+const idleDenied = async (peer, since) => {
+  await closed(peer, 1008, "Access denied");
+  assert.ok(performance.now() - since <= 7200, "transport retirement <=7s plus 200ms harness margin");
+};
+for (const mode of ["logout", "actor inactive", "owner inactive", "removed", "identity mismatch", "expired", "nonack"])
+  test(`idle authorization: ${mode}`, { timeout: 20_000 }, (t) => idleFixture(t, async ({ f, a, b, id, second, other, open, sid, row, checkpoint, restore, fanout }) => {
+    const duplicate = await open("probe", second), owner2 = await open("owner", second);
+    await fanout(duplicate, owner2, f.users.member);
+    const alternate = await open("probe2"), alternate2 = await open("probe2", second);
+    await fanout(alternate, b, f.users.member); await fanout(alternate2, owner2, f.users.member);
+    const c = await open("stranger", other), d = await open("stranger", other);
+    await fanout(c, d, f.users.stranger);
+    const since = performance.now();
+    if (mode === "logout" || mode === "nonack") {
+      const result = await f.request("/api/auth/logout", "probe", "POST", undefined, {}, true);
+      assert.equal(result.status, 200); assert.deepEqual(result.body, { ok: true });
+      assert.match(result.headers["set-cookie"], /^excalidraw\.sid=; Path=\/; Expires=Thu, 01 Jan 1970 00:00:00 GMT/);
+      assert.deepEqual(await row(), []);
+    } else if (mode.endsWith("inactive")) {
+      const actor = mode.startsWith("actor") ? "member" : "owner";
+      const result = await f.request(`/api/admin/users/${f.users[actor]}`, "admin", "PUT", { isActive: false });
+      assert.equal(result.status, 200); assert.equal(result.body.user.isActive, false); await checkpoint(actor, false, result.body.user);
+    } else if (mode === "removed") await f.setup("DELETE FROM fixture_schema.user_sessions WHERE sid=$1", [sid("probe")]);
+    else if (mode === "identity mismatch") await f.setup("UPDATE fixture_schema.user_sessions SET sess=jsonb_set(sess::jsonb,'{user,id}',to_jsonb($1::text)) WHERE sid=$2", [String(f.users.owner), sid("probe")]);
+    else await f.setup("UPDATE fixture_schema.user_sessions SET expire=NOW()-INTERVAL '1 second' WHERE sid=$1", [sid("probe")]);
+    const stored = await row(); // Do not roll the subject SID through HTTP snapshots.
+    const doomed = mode.endsWith("inactive") ? [a, duplicate, alternate, alternate2, ...(mode === "owner inactive" ? [b, owner2] : [])] : [a, duplicate];
+    await Promise.all(doomed.map((peer) => idleDenied(peer, since)));
+    await restore(); // Public document/ETag/revision/membership snapshots remain the original oracle.
+    if (mode === "nonack") {
+      const { closeFrame, transportEnd } = a.retirement;
+      assert.deepEqual({ code: closeFrame?.code, reason: closeFrame?.reason }, { code: 1008, reason: "Access denied" });
+      assert.equal(typeof transportEnd, "number", "actual remote TCP end, not self-disposal");
+      assert.ok(transportEnd - closeFrame.at <= 1200, "one-second force-termination grace + harness margin");
+    }
+    if (!mode.endsWith("inactive")) { await fanout(alternate, b, f.users.member); await fanout(alternate2, owner2, f.users.member); }
+    else if (mode === "actor inactive") { const valid = await open("owner", id); await fanout(b, valid, f.users.owner); }
+    await fanout(c, d, f.users.stranger); await fanout(d, c, f.users.stranger);
+    assert.deepEqual(await row(), stored); assert.equal(f.streams().stderr, "");
+  }, mode !== "nonack"));
+
+for (const mode of ["audit-error", "query-stall", "pool-stall"])
+  test(`idle unavailable authorization: ${mode}`, { timeout: 20_000 }, (t) => idleFixture(t, async ({ f, a, b, other, open, sid, row, fanout }) => {
+    await b.dispose(); // Only the proven subject exists when the next acquisition is armed.
+    const stored = await row();
+    const fault = await f.realtimeControl("arm", { mode, sid: sid("probe") });
+    const since = performance.now();
+    // Subscribe before arming; absent baseline audits cannot become setup RED.
+    const progress = (async () => {
+      if (!await fault.observed) return;
+      const c = await open("stranger", other), d = await open("stranger", other);
+      await fanout(c, d, f.users.stranger); await fanout(d, c, f.users.stranger);
+      const newcomer = await open("arrival", other); await fanout(newcomer, c, f.users.stranger);
+      const start = performance.now(); await f.setup("DELETE FROM fixture_schema.user_sessions WHERE sid=$1", [sid("arrival")]);
+      await idleDenied(newcomer, start); await fanout(c, d, f.users.stranger);
+    })();
+    progress.catch(() => {});
+    try {
+      await idleDenied(a, since); await progress;
+      const state = await f.realtimeControl("status");
+      assert.equal(state.consumed, 1); assert.equal(state.earlyRelease, 0);
+      if (mode === "query-stall") { assert.equal(state.pending, 1); assert.equal(state.matches, 1, "one pending audit per peer"); }
+      if (mode === "pool-stall") { assert.equal(state.pending, 1); assert.equal(state.matches, 0, "no overlapping audit while acquisition is pending"); }
+      assert.deepEqual(await row(), stored); assert.equal(f.streams().stderr, "");
+      await f.realtimeControl("release");
+      if (mode !== "audit-error") {
+        const settled = await fault.settled;
+        assert.ok(settled, "consumed acquisition/query eventually releases its client");
+        assert.equal(settled.earlyRelease, 0);
+        if (mode === "query-stall") { assert.equal(settled.queryDone, true); assert.equal(settled.rollbackDone, true); }
+      }
+    } finally { await f.realtimeControl("release"); fault.cancel(); await progress; }
+  }));
+
+for (const mode of ["logout-error", "deactivate-error"])
+  test(`failed lifecycle preserves valid idle peers: ${mode}`, { timeout: 20_000 }, (t) => idleFixture(t, async ({ f, a, b, open, sid, row, fanout }) => {
+    const stored = await row();
+    const fault = await f.realtimeControl("arm", { mode, sid: sid("probe"), actor: String(f.users.member) });
+    const result = mode === "logout-error" ? await f.request("/api/auth/logout", "probe", "POST", undefined, {}, true)
+      : await f.request(`/api/admin/users/${f.users.member}`, "admin", "PUT", { isActive: false }, {}, true);
+    assert.equal(result.status, 500); assert.deepEqual(result.body, { error: "Se produjo un error interno en el servidor." });
+    assert.equal(result.warning, null); assert.match(result.headers["content-type"], /^application\/json; charset=utf-8$/);
+    const { default: responseETag } = await import("etag");
+    assert.equal(result.etag, responseETag(JSON.stringify(result.body), { weak: true }));
+    assert.equal(result.headers["content-length"], String(Buffer.byteLength(JSON.stringify(result.body))));
+    assert.ok(!result.headers["set-cookie"]?.startsWith("excalidraw.sid=;"), "failed logout never clears cookie");
+    const status = await f.realtimeControl("status"); assert.equal(status.consumed, 1);
+    assert.ok(await fault.observed); fault.cancel();
+    await f.realtimeControl("release"); assert.deepEqual(await row(), stored);
+    await fanout(a, b, f.users.member); await fanout(b, a, f.users.owner);
+    // A distinct invalid idle SID supplies an actual audit boundary; a quiet
+    // interval alone is never evidence that the valid subject stayed authorized.
+    const sentinel = await open("probe2"); await fanout(sentinel, b, f.users.member);
+    const since = performance.now(); await f.setup("DELETE FROM fixture_schema.user_sessions WHERE sid=$1", [sid("probe2")]);
+    await idleDenied(sentinel, since); await fanout(a, b, f.users.member);
+    assert.deepEqual(await row(), stored);
+    assert.equal(f.streams().stderr, status.expectedError, "only the exact intentional error stack is logged");
+  }));

@@ -141,6 +141,29 @@ export const persistenceFixture = async (t, { seedData, realtime = false } = {})
     server.send({ realtime: "observe", now });
     return reply;
   };
+  let controlId = 0;
+  const realtimeControl = async (action, options = {}) => {
+    assert.equal(realtime, true);
+    const id = ++controlId;
+    const response = (async () => {
+      for (;;) {
+        const [event] = await once(server, "message", { signal: AbortSignal.timeout(2000) });
+        if (event.control === id) return event;
+      }
+    })();
+    const watchers = [];
+    const watch = (phase) => new Promise((resolve) => {
+      const listener = (event) => { if (event.fault === id && event.phase === phase) finish(event); };
+      const finish = (event = null) => { clearTimeout(timer); server.off("message", listener); resolve(event); };
+      const timer = setTimeout(finish, 10_000); watchers.push(finish); server.on("message", listener);
+    });
+    const events = action === "arm" ? { observed: watch("observed"), settled: watch("settled") } : {};
+    const cancel = () => watchers.forEach((finish) => finish());
+    t.after(cancel);
+    server.send({ control: id, action, ...options });
+    return { ...await response, ...events, cancel };
+  };
+  t.after(() => { if (realtime && server.connected) server.send({ control: 0, action: "release" }); });
   const blocked = async (count) => {
     const deadline = Date.now() + 5000;
     do {
@@ -179,6 +202,6 @@ export const persistenceFixture = async (t, { seedData, realtime = false } = {})
     accounts[alias] = login.body.user;
   };
   return { request, snapshot, setup, directory, users, storageBarrier, blocked, documentLock,
-    directoryLock, loginAs, backups, realtimeGate, realtimeObserve,
+    directoryLock, loginAs, backups, realtimeGate, realtimeObserve, realtimeControl,
     cookieFor: (user) => cookies[user], logs: () => output, streams: () => ({ stdout, stderr }) };
 };

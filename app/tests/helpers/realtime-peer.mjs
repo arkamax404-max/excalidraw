@@ -2,10 +2,20 @@ import WebSocket from "ws";
 import { realtimeOrigin } from "./realtime-client.mjs";
 
 // One bounded event queue, including terminal events; no background promise chain.
-export const realtimePeer = (id, cookie, { compression = false, maxFrameBytes = 65536 } = {}) => {
+export const realtimePeer = (id, cookie, { compression = false, maxFrameBytes = 65536, deadlineMs = 3000, acknowledgeClose = true } = {}) => {
   const socket = new WebSocket(`${realtimeOrigin.replace("http:", "ws:")}/api/realtime/diagrams/${id}`, {
     headers: { Cookie: cookie, Origin: realtimeOrigin },
     perMessageDeflate: compression, handshakeTimeout: 2000,
+  });
+  let closeFrame;
+  let transportEnd;
+  if (!acknowledgeClose) socket.once("open", () => {
+    // ws normally calls close() from its receiver's conclude handler to ACK.
+    socket.close = () => {};
+    socket._receiver.once("conclude", (code, reason) => {
+      closeFrame = { code, reason: reason.toString("utf8"), at: performance.now() };
+    });
+    socket._socket.once("end", () => { transportEnd = performance.now(); });
   });
   const queue = [];
   let waiting;
@@ -38,8 +48,8 @@ export const realtimePeer = (id, cookie, { compression = false, maxFrameBytes = 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         waiting = undefined;
-        reject(new Error("Realtime event deadline exceeded"));
-      }, 3000);
+        reject(new Error(deadlineMs === 3000 ? "Realtime event deadline exceeded" : "Realtime idle close missing within safety deadline"));
+      }, deadlineMs);
       waiting = (event) => {
         clearTimeout(timer); waiting = undefined;
         if (!consume && event.type !== "cancelled") queue.unshift(event);
@@ -61,7 +71,7 @@ export const realtimePeer = (id, cookie, { compression = false, maxFrameBytes = 
       socket.terminate();
     });
   };
-  return { next, dispose, cancelRead: () => waiting?.({ type: "cancelled" }),
+  return { next, dispose, get retirement() { return { closeFrame, transportEnd }; }, cancelRead: () => waiting?.({ type: "cancelled" }),
     get open() { return socket.readyState === WebSocket.OPEN; },
     get extensions() { return socket.extensions; }, send: (value, options) => {
     if (socket.readyState !== WebSocket.OPEN) throw new Error("Realtime peer is not open");

@@ -140,11 +140,23 @@ plus a frame exceeding 25 MiB closes the affected connection with 1013.
 Every delivery freshly locks both sessions, active actors/owner, room and memberships
 through synchronous enqueue, with expiry rechecked immediately beforehand. Invalid
 recipients are excluded without disconnecting valid peers. No session is renewed.
-Idle/event-driven invalidation and editor convergence remain future T4c–d/T5–T6 work.
+Each peer has an independent 1s idle audit through that same authorization gate, with at most one pending audit per peer.
+Admission starts a monotonic 5s freshness cap; only timely positive authorization under the current row locks refreshes it.
+Stalled/unverifiable authorization closes with 1008 `Access denied` by the next tick (at most 6s), then forces termination after 1s grace.
+Thus transport retirement is bounded by 7s under a responsive event loop; closing drops queued/new messages without renewing WS sessions.
+Real HTTP-server shutdown/late-admission lifecycle remains C1b; canonical SQL-boundary invalidation and editor convergence remain T4d/T5–T6.
 HTTP remains the sole guarded scene/revision/ETag authority; there is no WS persistence,
 scene/file cache or backup change. API regressions cover real cookies, close boundaries,
 revocation overlap and canonical/account/membership/backup non-effects. Controlled buffer
 faults test backpressure, not TCP throughput. This is **not deployment approval**.
+
+C1a idle authorization is covered by API regressions and a baseline compatibility comparison.
+No wire/data format, sender identity, HTTP canonical authority, revisions, files or backup policy changes are introduced.
+They require genuine ready/relay before idle invalidation, exact policy retirement,
+and independent-SID snapshot reads. Injected query/acquisition stalls hold JavaScript
+promises before SQL/pool acquisition; they do not simulate PG locks or TCP saturation.
+The nonacknowledging peer observes remote TCP end before teardown. Real server-close
+and late-upgrade lifecycle proof is deferred to C1b; SQL-before-cleanup invalidation to T4d.
 
 ### Stable-ID reads
 

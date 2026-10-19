@@ -45,3 +45,71 @@ pg.Client.prototype.query = async function (...args) {
   }
   return result;
 };
+
+// A-only injected promise stalls BEFORE SQL/acquisition, not PG locks or pool exhaustion.
+let fault, unblock, tracked, faultArmed = false;
+let consumed = 0, matches = 0, pending = 0, earlyRelease = 0, expectedError;
+const state = () => ({ consumed, matches, pending, earlyRelease, expectedError: expectedError && expectedError.stack + "\n",
+  queryDone: tracked?.queryDone, rollbackDone: tracked?.rollbackDone });
+const observed = () => process.send({ fault: fault.control, phase: "observed" });
+process.on("message", (event) => {
+  if (event.control === undefined) return;
+  if (event.action === "arm") {
+    fault = event; faultArmed = true; tracked = undefined; consumed = matches = pending = earlyRelease = 0; expectedError = undefined;
+  } else if (event.action === "release") { faultArmed = false; unblock?.(); }
+  process.send({ control: event.control, ...state() });
+});
+const hold = () => new Promise((resolve) => { pending++; unblock = () => { pending--; unblock = undefined; resolve(); }; });
+const track = (client, began = false) => {
+  const record = { client, began, active: 0, queryDone: false, rollbackDone: false, token: fault.control };
+  tracked = record;
+  const releaseClient = client.release;
+  client.release = (...args) => {
+    if (record.active || (record.began && (!record.queryDone || !record.rollbackDone))) earlyRelease++;
+    client.release = releaseClient;
+    process.send({ fault: record.token, phase: "settled", ...state() });
+    return releaseClient(...args);
+  };
+};
+const faultQuery = pg.Client.prototype.query;
+pg.Client.prototype.query = function (...args) {
+  const sql = String(args[0]?.text ?? args[0]), values = args[0]?.values ?? args[1];
+  const audit = fault && ["audit-error", "query-stall", "pool-stall"].includes(fault.mode) &&
+    /SELECT sid, sess, EXTRACT/.test(sql) && values?.[0]?.includes(fault.sid);
+  const mutation = fault && ((fault.mode === "logout-error" && /^DELETE FROM .*user_sessions/.test(sql) && values?.[0] === fault.sid) ||
+    (fault.mode === "deactivate-error" && /UPDATE .*users\s+SET/s.test(sql) && String(values?.[0]) === fault.actor));
+  if (audit) matches++;
+  const selected = faultArmed && (audit || mutation) && !consumed;
+  if (selected) { consumed++; if (fault.mode === "query-stall") track(this, true); }
+  const record = tracked?.client === this ? tracked : null;
+  if (!selected && !record) return faultQuery.apply(this, args);
+  const callback = typeof args.at(-1) === "function" ? args.pop() : args[0]?.callback;
+  if (args[0]?.callback) args[0] = { ...args[0], callback: undefined };
+  const run = async () => {
+    if (record) { record.active++; if (/^BEGIN\b/.test(sql)) record.began = true; }
+    try {
+      if (selected) {
+        const stalled = fault.mode === "query-stall" ? hold() : null;
+        observed();
+        if (stalled) await stalled;
+        else { const error = new Error(`isolated realtime ${fault.mode}`); expectedError = error; throw error; }
+      }
+      const result = await faultQuery.apply(this, args);
+      if (record && /SELECT sid, sess, EXTRACT/.test(sql)) record.queryDone = true;
+      if (record && /^ROLLBACK\b/.test(sql)) record.rollbackDone = true;
+      return result;
+    } finally { if (record) record.active--; }
+  };
+  if (callback) { void run().then((result) => callback(null, result), callback); return; }
+  return run();
+};
+const connect = pg.Pool.prototype.connect;
+pg.Pool.prototype.connect = function (...args) {
+  if (!faultArmed || fault?.mode !== "pool-stall" || consumed) return connect.apply(this, args);
+  consumed++;
+  const stalled = hold(); observed();
+  const acquire = async () => { await stalled; const client = await connect.call(this); track(client); return client; };
+  const callback = args[0];
+  if (typeof callback === "function") { void acquire().then((client) => callback(null, client, client.release), callback); return; }
+  return acquire();
+};

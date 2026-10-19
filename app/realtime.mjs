@@ -1,5 +1,6 @@
 import { STATUS_CODES } from "node:http";
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { WebSocketServer } from "ws";
 
 const canonicalId = (id) => typeof id === "string" &&
@@ -72,6 +73,12 @@ export const attachRealtime = (server, { sessionMiddleware, pool, schema, sessio
   const close = (peer, code = 1008, reason = "Access denied") => {
     peer.queue.length = 0; peer.bytes = 0;
     if (live(peer)) peer.socket.close(code, reason);
+    if (code === 1008 && reason === "Access denied" && peer.socket.readyState !== 3 && !peer.reaper) {
+      peer.reaper = setTimeout(() => {
+        if (peer.socket.readyState !== 3) peer.socket.terminate();
+      }, 1000);
+      peer.reaper.unref();
+    }
   };
   const deliver = async (sender, recipient, frame) => {
     if (!live(sender)) return;
@@ -102,7 +109,14 @@ export const attachRealtime = (server, { sessionMiddleware, pool, schema, sessio
         return;
       }
       if (!valid(sender)) return close(sender);
-      if (recipient && !valid(recipient)) return close(recipient);
+      // Only a live, timely, positive proof under these locks advances freshness.
+      for (const peer of [sender, recipient].filter(Boolean)) {
+        if (!valid(peer)) { close(peer); continue; }
+        if (!live(peer)) continue;
+        const provedAt = performance.now();
+        if (provedAt - peer.authorizedAt >= 5000) close(peer);
+        else peer.authorizedAt = provedAt;
+      }
       if (!live(sender) || !recipient || !live(recipient)) return;
       if (Buffer.byteLength(frame) > limit) return close(sender, 1009, "Message too large");
       if (recipient.socket.bufferedAmount + Buffer.byteLength(frame) > limit) return close(recipient, 1013, "Backpressure");
@@ -119,6 +133,12 @@ export const attachRealtime = (server, { sessionMiddleware, pool, schema, sessio
         }
       }
     }
+  };
+  const audit = async (peer) => {
+    peer.auditPending = true;
+    try { await deliver(peer); }
+    catch { close(peer); }
+    finally { peer.auditPending = false; }
   };
   const drain = async (peer) => {
     peer.busy = true;
@@ -187,8 +207,20 @@ export const attachRealtime = (server, { sessionMiddleware, pool, schema, sessio
         // Preserve ws protocol close codes (notably 1009) instead of destroying their close frame.
         client.on("error", () => { if (client.readyState === 1) client.close(1008, "Transport error"); });
         const peer = { socket: client, actor, sid: request.sessionID, id, peerId: randomUUID(), queue: [], bytes: 0, busy: false };
+        peer.authorizedAt = performance.now();
+        peer.auditPending = false;
         peers.add(peer);
-        client.once("close", () => { peers.delete(peer); peer.queue.length = 0; peer.bytes = 0; });
+        peer.watchdog = setInterval(() => {
+          if (!live(peer)) return;
+          if (performance.now() - peer.authorizedAt >= 5000) return close(peer);
+          if (!peer.auditPending) void audit(peer);
+        }, 1000);
+        peer.watchdog.unref();
+        client.once("close", () => {
+          clearInterval(peer.watchdog);
+          clearTimeout(peer.reaper);
+          peers.delete(peer); peer.queue.length = 0; peer.bytes = 0;
+        });
         client.on("message", (data, binary) => {
           if (!live(peer)) return;
           if (peer.queue.length >= 8 || peer.bytes + data.length > limit) return close(peer, 1013, "Queue overloaded");
