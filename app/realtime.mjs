@@ -82,8 +82,7 @@ export const attachRealtime = (server, { sessionMiddleware, pool, schema, sessio
       peer.reaper.unref();
     }
   };
-  const deliver = async (sender, recipient, frame) => {
-    if (!live(sender)) return;
+  const authorizeLocked = async (sender, recipient, consume, onFailure) => {
     let connection;
     try {
       connection = await pool.connect();
@@ -103,9 +102,24 @@ export const attachRealtime = (server, { sessionMiddleware, pool, schema, sessio
       // Everything below, including enqueue, is synchronous while all rows remain locked.
       const now = Math.ceil(Date.now() / 1000);
       const active = (id) => users.some((user) => user.id === id && user.is_active);
-      const valid = (peer) => sessions.some((row) => row.sid === peer.sid &&
-        row.sess?.user?.id === peer.actor && Number(row.expires) >= now) && active(peer.actor) &&
+      const authenticated = (peer) => sessions.some((row) => row.sid === peer.sid &&
+        row.sess?.user?.id === peer.actor && Number(row.expires) >= now) && active(peer.actor);
+      const valid = (peer) => authenticated(peer) &&
         (peer.actor === owner || members.some((member) => member.user_id === peer.actor));
+      return consume({ owner, room, active, authenticated, valid });
+    } catch (error) {
+      onFailure?.();
+      throw error;
+    } finally {
+      if (connection) {
+        try { await connection.query("ROLLBACK"); connection.release(); }
+        catch (error) { connection.release(error); throw error; }
+      }
+    }
+  };
+  const deliver = async (sender, recipient, frame) => {
+    if (!live(sender)) return;
+    return authorizeLocked(sender, recipient, ({ owner, room, active, valid }) => {
       if (!room || room.user_id !== owner || !active(owner)) {
         for (const peer of peers) if (peer.id === sender.id) close(peer);
         return;
@@ -123,18 +137,13 @@ export const attachRealtime = (server, { sessionMiddleware, pool, schema, sessio
       if (Buffer.byteLength(frame) > limit) return close(sender, 1009, "Message too large");
       if (recipient.socket.bufferedAmount + Buffer.byteLength(frame) > limit) return close(recipient, 1013, "Backpressure");
       recipient.socket.send(frame);
-    } catch {
+    }, () => {
       close(sender);
       if (recipient) close(recipient);
-    } finally {
-      if (connection) {
-        try { await connection.query("ROLLBACK"); connection.release(); }
-        catch (error) {
-          connection.release(error); close(sender);
-          if (recipient) close(recipient);
-        }
-      }
-    }
+    }).catch(() => {
+      close(sender);
+      if (recipient) close(recipient);
+    });
   };
   const audit = async (peer) => {
     peer.auditPending = true;

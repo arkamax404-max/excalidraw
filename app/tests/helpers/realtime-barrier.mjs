@@ -6,6 +6,7 @@
 import pg from "pg";
 import WebSocket from "ws";
 import { Server } from "node:http";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 // Observe real realtime-owned timers, not unref status or active-handle visibility.
 const timers = new Map(), upgrades = [], closeEvents = [];
@@ -80,10 +81,20 @@ process.on("message", (event) => {
     release?.();
   }
 });
+
+// Message work carries its own context; scheduled audits cannot consume a frame fault.
+const frameContext = new AsyncLocalStorage(), begun = new WeakSet();
+const wsEmit = WebSocket.prototype.emit;
+WebSocket.prototype.emit = function (kind, ...args) {
+  if (kind === "message" && this._isServer) return frameContext.run(true, () => wsEmit.call(this, kind, ...args));
+  return wsEmit.call(this, kind, ...args);
+};
 const query = pg.Client.prototype.query;
 pg.Client.prototype.query = async function (...args) {
   const sql = String(args[0]?.text ?? args[0]);
   const result = await query.apply(this, args);
+  if (/^BEGIN\b/.test(sql)) begun.add(this);
+  if (/^ROLLBACK\b/.test(sql)) begun.delete(this);
   if (/^\s*(INSERT INTO|UPDATE)\b/i.test(sql) && sql.includes('"user_sessions"')) {
     sessionWrites.push(sql.trim().split(/\s+/)[0].toUpperCase());
   }
@@ -99,7 +110,8 @@ pg.Client.prototype.query = async function (...args) {
 let fault, unblock, tracked, faultArmed = false;
 let consumed = 0, matches = 0, pending = 0, earlyRelease = 0, expectedError;
 const state = () => ({ consumed, matches, pending, earlyRelease, expectedError: expectedError && expectedError.stack + "\n",
-  began: tracked?.began, queryDone: tracked?.queryDone, rollbackDone: tracked?.rollbackDone });
+  began: tracked?.began, queryDone: tracked?.queryDone, rollbackDone: tracked?.rollbackDone,
+  positive: tracked?.positive, rollbackSQLDone: tracked?.rollbackSQLDone, clientReleased: tracked?.clientReleased ?? false });
 const observed = () => process.send({ fault: fault.control, phase: "observed" });
 process.on("message", (event) => {
   if (event.control === undefined) return;
@@ -116,8 +128,10 @@ const track = (client, began = false) => {
   client.release = (...args) => {
     if (record.active || (record.began && (!record.queryDone || !record.rollbackDone))) earlyRelease++;
     client.release = releaseClient;
+    const result = releaseClient(...args);
+    record.clientReleased = true;
     process.send({ fault: record.token, phase: "settled", ...state() });
-    return releaseClient(...args);
+    return result;
   };
 };
 const faultQuery = pg.Client.prototype.query;
@@ -128,9 +142,11 @@ pg.Client.prototype.query = function (...args) {
   const mutation = fault && ((fault.mode === "logout-error" && /^DELETE FROM .*user_sessions/.test(sql) && values?.[0] === fault.sid) ||
     (fault.mode === "deactivate-error" && /UPDATE .*users\s+SET/s.test(sql) && String(values?.[0]) === fault.actor));
   const upgrade = fault?.mode === "upgrade-stall" && /SELECT EXISTS/.test(sql) && String(values?.[0]) === fault.actor;
-  if (audit || upgrade) matches++;
-  const selected = faultArmed && (audit || mutation || upgrade) && !consumed;
-  if (selected) { consumed++; if (fault.mode === "query-stall" || upgrade) track(this, !upgrade); }
+  const delayed = fault?.mode === "rollback-delay" && /SELECT sid, sess, EXTRACT/.test(sql) &&
+    values?.[0]?.includes(fault.sid) && Boolean(frameContext.getStore()) === (fault.kind !== "audit");
+  if (audit || upgrade || delayed) matches++;
+  const selected = faultArmed && (audit || mutation || upgrade || delayed) && !consumed;
+  if (selected) { consumed++; if (delayed || fault.mode === "query-stall" || upgrade) track(this, delayed ? begun.has(this) : !upgrade); }
   const record = tracked?.client === this ? tracked : null;
   if (!selected && !record) return faultQuery.apply(this, args);
   const callback = typeof args.at(-1) === "function" ? args.pop() : args[0]?.callback;
@@ -138,6 +154,13 @@ pg.Client.prototype.query = function (...args) {
   const run = async () => {
     if (record) { record.active++; if (/^BEGIN\b/.test(sql)) record.began = true; }
     try {
+      if (selected && delayed) {
+        const positive = await faultQuery.apply(this, args);
+        record.queryDone = true;
+        record.positive = positive.rows.some((row) => row.sid === fault.sid &&
+          row.sess?.user?.id === fault.actor && Number(row.expires) >= Math.ceil(Date.now() / 1000));
+        throw new Error("isolated authorization rejection after positive SID result");
+      }
       if (selected) {
         const stalled = ["query-stall", "upgrade-stall"].includes(fault.mode) ? hold() : null;
         observed();
@@ -146,7 +169,13 @@ pg.Client.prototype.query = function (...args) {
       }
       const result = await faultQuery.apply(this, args);
       if (record && /SELECT sid, sess, EXTRACT|SELECT EXISTS/.test(sql)) record.queryDone = true;
-      if (record && /^ROLLBACK\b/.test(sql)) record.rollbackDone = true;
+      if (record && /^ROLLBACK\b/.test(sql)) {
+        if (fault.mode === "rollback-delay" && !record.rollbackSQLDone) {
+          record.rollbackSQLDone = true;
+          const stalled = hold(); observed(); await stalled;
+        }
+        record.rollbackDone = true;
+      }
       return result;
     } finally { if (record) record.active--; }
   };

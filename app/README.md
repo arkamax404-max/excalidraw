@@ -150,6 +150,11 @@ scene/file cache or backup change. API regressions cover real cookies, close bou
 revocation overlap and canonical/account/membership/backup non-effects. Controlled buffer
 faults test backpressure, not TCP throughput. This is **not deployment approval**.
 
+Authorization query/consumer failures close affected transports before awaiting
+ROLLBACK settlement; borrowed clients are still released only after settlement.
+The fault regression delays JavaScript delivery of a real completed ROLLBACK,
+not PostgreSQL itself, and checks silent policy close without watchdog rescue.
+
 C1a idle authorization is covered by API regressions and a baseline compatibility comparison.
 No wire/data format, sender identity, HTTP canonical authority, revisions, files or backup policy changes are introduced.
 They require genuine ready/relay before idle invalidation, exact policy retirement,

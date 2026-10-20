@@ -653,16 +653,20 @@ const idleFixture = async (t, body, acknowledgeClose = true) => {
         data: Buffer.from(JSON.stringify({ type: sync.type, sender: { userId: String(userId), peerId }, payload: sync.payload })) });
     } finally { sender.cancelRead(); recipients.forEach((peer) => peer.cancelRead()); }
   };
+  let failure;
   try {
     const a = await open("probe", id, acknowledgeClose), b = await open("owner");
     await fanout(a, b, f.users.member); await fanout(b, a, f.users.owner);
-    await body({ f, a, b, id, second, other, open, sid, row, fanout, checkpoint, restore });
+    await body({ f, a, b, id, second, other, open, sid, row, fanout, checkpoint, restore, snapshot });
     for (const peer of peers.filter((peer) => peer.open)) { peer.send("unsupported"); await closed(peer, 1008, "No data protocol yet"); }
-  } finally {
-    await restore(); // Also restore on baseline idle-rule failure, without masking it with inaccessible snapshots.
-    await f.realtimeControl("release");
-    try { await Promise.all(peers.map((peer) => peer.dispose())); }
-    finally { assert.deepEqual(await snapshot(), expected); }
+  } catch (error) { failure = error; throw error; }
+  finally {
+    try {
+      await restore(); // Also restore on baseline idle-rule failure, without masking it with inaccessible snapshots.
+      await f.realtimeControl("release");
+      try { await Promise.all(peers.map((peer) => peer.dispose())); }
+      finally { assert.deepEqual(await snapshot(), expected); }
+    } catch (cleanupError) { if (!failure) throw cleanupError; failure.cause ??= cleanupError; }
   }
 };
 const idleDenied = async (peer, since) => {
@@ -828,3 +832,76 @@ for (const mode of ["query-stall", "pool-stall", "upgrade-stall"])
       }
     }
   });
+
+import { mkdir, readdir, readFile, rmdir, unlink, writeFile } from "node:fs/promises";
+const admissionTree = async (root, relative = "") => {
+  const tree = {};
+  for (const entry of await readdir(`${root}/${relative}`, { withFileTypes: true })) {
+    const name = relative + entry.name;
+    if (entry.isDirectory()) { tree[name + "/"] = true; Object.assign(tree, await admissionTree(root, name + "/")); }
+    else tree[name] = (await readFile(`${root}/${name}`)).toString("base64");
+  }
+  return tree;
+};
+
+// A completed SQL rollback with a pending JS promise cannot postpone policy close.
+for (const kind of ["zero-recipient", "recipient", "audit"])
+  test(`authorization rejection before rollback settlement: ${kind}`, { timeout: 20_000 }, (t) => idleFixture(t, async ({ f, a, b, other, open, sid, row, fanout, snapshot }) => {
+    const receiver = kind === "recipient" ? await open("probe2") : null;
+    const c = await open("arrival", other), d = await open("arrival", other);
+    await writeFile(`${f.directory}/byte-sentinel.bin`, Buffer.from([0, 255, 128]));
+    await mkdir(`${f.directory}/empty-sentinel`);
+    const capture = async () => ({ canonical: await snapshot(), tree: await admissionTree(f.directory),
+      sessions: await Promise.all(["probe", "probe2", "arrival"].map((user) => row(user))) });
+    const before = await capture();
+    assert.equal(before.tree["byte-sentinel.bin"], "AP+A");
+    assert.equal(before.tree["empty-sentinel/"], true);
+    const since = performance.now();
+    await fanout(b, a, f.users.owner); // A new positive proof before arming, not just a ready frame.
+    await b.dispose();
+    const fault = await f.realtimeControl("arm", { mode: "rollback-delay", kind, sid: sid("probe"), actor: String(f.users.member) });
+    let failure, closeTimer;
+    try {
+      if (kind !== "audit") a.send(sync);
+      const observed = await fault.observed;
+      assert.ok(observed, "positive query and same-client real ROLLBACK reached before deadline");
+      assert.ok(performance.now() - since <= 2500, "marker within 2500ms of positive proof");
+      const held = await f.realtimeControl("status");
+      assert.deepEqual({ consumed: held.consumed, began: held.began, positive: held.positive,
+        queryDone: held.queryDone, sql: held.rollbackSQLDone, rollbackDone: held.rollbackDone,
+        pending: held.pending, released: held.clientReleased, early: held.earlyRelease },
+      { consumed: 1, began: true, positive: true, queryDone: true, sql: true, rollbackDone: false,
+        pending: 1, released: false, early: 0 });
+      const doomed = [a, ...(receiver ? [receiver] : [])], closeSince = performance.now();
+      try {
+        await Promise.race([Promise.all(doomed.map((peer) => closed(peer, 1008, "Access denied"))),
+          new Promise((_, reject) => { closeTimer = setTimeout(() => reject(new assert.AssertionError({
+            message: "policy close/end missing before explicit ROLLBACK release" })), 1500); })]);
+      } finally { clearTimeout(closeTimer); doomed.forEach((peer) => peer.cancelRead()); }
+      assert.ok(performance.now() - closeSince <= 1500, "close/end deadline");
+      if (kind === "audit") {
+        assert.deepEqual({ code: a.retirement.closeFrame?.code, reason: a.retirement.closeFrame?.reason },
+          { code: 1008, reason: "Access denied" });
+        assert.equal(typeof a.retirement.transportEnd, "number", "actual nonack TCP end before teardown");
+      }
+      assert.ok(performance.now() - since < 5000, "no 5s watchdog rescue");
+      await fanout(c, d, f.users.stranger); await fanout(d, c, f.users.stranger);
+      assert.deepEqual(await capture(), before);
+      assert.equal(f.streams().stderr, "");
+      const stillHeld = await f.realtimeControl("status");
+      assert.equal(stillHeld.pending, 1); assert.equal(stillHeld.clientReleased, false);
+    } catch (error) { failure = error; throw error; }
+    finally {
+      try {
+        await f.realtimeControl("release");
+        const settled = await fault.settled;
+        assert.ok(settled, "borrowed client eventually released");
+        assert.deepEqual({ query: settled.queryDone, rollback: settled.rollbackDone, sql: settled.rollbackSQLDone,
+          pending: settled.pending, released: settled.clientReleased, early: settled.earlyRelease },
+        { query: true, rollback: true, sql: true, pending: 0, released: true, early: 0 });
+        await unlink(`${f.directory}/byte-sentinel.bin`);
+        await rmdir(`${f.directory}/empty-sentinel`);
+      } catch (cleanupError) { if (!failure) throw cleanupError; failure.cause ??= cleanupError; }
+      finally { fault.cancel(); }
+    }
+  }, kind !== "audit"));
