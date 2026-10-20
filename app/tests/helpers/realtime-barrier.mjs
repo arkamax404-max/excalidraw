@@ -114,7 +114,7 @@ const state = () => ({ consumed, matches, pending, earlyRelease, expectedError: 
   positive: tracked?.positive, rollbackSQLDone: tracked?.rollbackSQLDone, clientReleased: tracked?.clientReleased ?? false });
 const observed = () => process.send({ fault: fault.control, phase: "observed" });
 process.on("message", (event) => {
-  if (event.control === undefined) return;
+  if (event.control === undefined || event.admission) return;
   if (event.action === "arm") {
     fault = event; faultArmed = true; tracked = undefined; consumed = matches = pending = earlyRelease = 0; expectedError = undefined;
   } else if (event.action === "release") { faultArmed = false; unblock?.(); }
@@ -191,4 +191,86 @@ pg.Pool.prototype.connect = function (...args) {
   const callback = args[0];
   if (typeof callback === "function") { void acquire().then((client) => callback(null, client, client.release), callback); return; }
   return acquire();
+};
+
+// D1 only: observe real SQL results; keep mutation delivery out of its HTTP route.
+const admissionContext = new AsyncLocalStorage();
+let admission;
+const admissionState = () => ({ ...admission?.state, expectedError: admission?.error && admission.error.stack + "\n" });
+const admissionEvent = (phase) => process.send({ fault: admission.token, phase, ...admissionState() });
+const admissionSettled = () => {
+  if (admission?.released && !admission.active && (!admission.client || admission.state.clientReleased)) admissionEvent("settled");
+};
+process.on("message", (event) => {
+  if (!event.admission) return;
+  if (event.action === "arm") admission = { ...event, token: event.control, holds: {}, active: 0, clientActive: 0,
+    state: { admissionHits: 0, mutationHits: 0, ready: 0, rollbackAfterReady: false, earlyRelease: 0 } };
+  if (event.action === "release") {
+    for (const [stage, resolve] of Object.entries(admission?.holds ?? {})) if (!event.stage || event.stage === stage) resolve();
+    if (admission && !event.stage) { admission.released = true; admissionSettled(); }
+  }
+  process.send({ control: event.control, ...admissionState() });
+});
+const emit = Server.prototype.emit;
+Server.prototype.emit = function (kind, ...args) {
+  const request = args[0], d = admission;
+  if (kind === "upgrade" && d && request.url === `/api/realtime/diagrams/${d.room}` &&
+      request.headers.cookie?.includes(encodeURIComponent(`s:${d.sid}.`))) return admissionContext.run(d, () => emit.call(this, kind, ...args));
+  return emit.call(this, kind, ...args);
+};
+const send = WebSocket.prototype.send;
+WebSocket.prototype.send = function (data, ...args) {
+  const d = admissionContext.getStore();
+  if (d && this._isServer && String(data).includes('"type":"ready"')) d.state.ready++;
+  return send.call(this, data, ...args);
+};
+const admissionQuery = pg.Client.prototype.query;
+pg.Client.prototype.query = function (...args) {
+  const d = admission, sql = String(args[0]?.text ?? args[0]), values = args[0]?.values ?? args[1];
+  const selected = d && !d.released && admissionContext.getStore() === d && !d.state.admissionHits &&
+    (d.stage === "identity" ? /SELECT sess FROM/.test(sql) && values?.[0] === d.sid :
+      d.stage === "gate" ? d.state.ready === 0 && /diagram_members[\s\S]*FOR SHARE/.test(sql) && String(values?.[0]) === d.room : /SELECT EXISTS/.test(sql) && String(values?.[1]) === d.room);
+  const mutation = d && !d.released && !d.state.mutationHits && /^\s*DELETE FROM/.test(sql) &&
+    (d.operation === "member" ? /diagram_members/.test(sql) && String(values?.[0]) === d.room :
+      d.operation === "diagram" ? /diagrams AS diagrams/.test(sql) && values?.[1] === "shared" : /\.users\b/.test(sql) && String(values?.[0]) === d.target);
+  const rollback = d?.client === this && /^ROLLBACK\b/.test(sql);
+  const selectedOwned = selected || rollback;
+  if (!selected && !mutation && !rollback) return admissionQuery.apply(this, args);
+  if (selected) d.state.admissionHits++;
+  if (mutation) d.state.mutationHits++;
+  if (selected) {
+    d.client = this;
+    const releaseClient = this.release;
+    this.release = (...values) => {
+      if (d.clientActive || !d.state.queryDone || (d.stage === "gate" && !d.state.rollbackAfterReady)) d.state.earlyRelease++;
+      d.state.clientReleased = true; this.release = releaseClient; admissionSettled();
+      return releaseClient.apply(this, values);
+    };
+  }
+  const callback = typeof args.at(-1) === "function" ? args.pop() : args[0]?.callback;
+  if (args[0]?.callback) args[0] = { ...args[0], callback: undefined };
+  const holdStage = (stage) => new Promise((resolve) => { d.holds[stage] = () => { delete d.holds[stage]; resolve(); }; });
+  const run = async () => {
+    d.active++;
+    if (selectedOwned) d.clientActive++;
+    try {
+      if (selected && d.stage === "before") { const held = holdStage("admission"); admissionEvent("observed"); await held; }
+      if (mutation && d.fail) { const error = new Error("isolated admission DELETE failure"); d.error = error; admissionEvent("mutation"); throw error; }
+      const result = await admissionQuery.apply(this, args);
+      if (selected) d.state.queryDone = true;
+      if (rollback) d.state.rollbackAfterReady = d.state.ready === 1;
+      if (selected && d.stage !== "before") {
+        d.state.positive = d.stage === "positive" ? result.rows[0]?.allowed : result.rowCount > 0;
+        const held = holdStage("admission"); admissionEvent("observed"); await held;
+      }
+      if (mutation) { d.state.mutationSettled = result.rowCount; const held = holdStage("mutation"); admissionEvent("mutation"); await held; }
+      return result;
+    } finally {
+      d.active--;
+      if (selectedOwned) d.clientActive--;
+      admissionSettled();
+    }
+  };
+  if (callback) { void run().then((result) => callback(null, result), callback); return; }
+  return run();
 };

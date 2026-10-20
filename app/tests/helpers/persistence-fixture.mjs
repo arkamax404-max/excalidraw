@@ -16,8 +16,9 @@ export const persistenceFixture = async (t, { seedData, realtime = false } = {})
   const directory = await mkdtemp(path.join(tmpdir(), "excalidraw-persistence-"));
   const pool = new pg.Pool();
   let server;
-  let closed;
+  let closed, admissionArmed = false;
   t.after(async () => {
+    if (admissionArmed && server?.connected) server.send({ admission: true, control: 0, action: "release" });
     if (server?.exitCode === null) {
       server.kill("SIGTERM");
       await closed;
@@ -157,6 +158,7 @@ export const persistenceFixture = async (t, { seedData, realtime = false } = {})
   let controlId = 0;
   const realtimeControl = async (action, options = {}) => {
     assert.equal(realtime, true);
+    if (options.admission && action === "arm") admissionArmed = true;
     const id = ++controlId;
     const response = (async () => {
       for await (const [event] of on(server, "message", { signal: AbortSignal.timeout(2000) })) {
@@ -169,7 +171,8 @@ export const persistenceFixture = async (t, { seedData, realtime = false } = {})
       const finish = (event = null) => { clearTimeout(timer); server.off("message", listener); resolve(event); };
       const timer = setTimeout(finish, deadline); watchers.push(finish); server.on("message", listener);
     });
-    const events = action === "arm" ? { observed: watch("observed", options.mode === "rollback-delay" ? 2500 : 10_000), settled: watch("settled") } : {};
+    const events = action === "arm" ? { observed: watch("observed", options.admission ? 1500 : options.mode === "rollback-delay" ? 2500 : 10_000), settled: watch("settled"),
+      ...(options.admission ? { mutation: watch("mutation") } : {}) } : {};
     const cancel = () => watchers.forEach((finish) => finish());
     t.after(cancel);
     server.send({ control: id, action, ...options });

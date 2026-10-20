@@ -905,3 +905,107 @@ for (const kind of ["zero-recipient", "recipient", "audit"])
       finally { fault.cancel(); }
     }
   }, kind !== "audit"));
+
+// D1: SQL settlement, not route notification or a JS permission cache, fences admission.
+const admissionReady = async (raw, id) => {
+  const deadline = performance.now() + 1500;
+  while (!raw.state().response.includes('"type":"ready"') && performance.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.match(raw.state().response, /HTTP\/1\.1 101/, "D1 valid admission did not upgrade");
+  assert.ok(raw.state().response.includes(JSON.stringify({ type: "ready", diagramId: id })), "D1 valid admission missing exact ready");
+};
+for (const operation of ["member", "diagram", "actor", "owner"])
+  for (const schedule of ["stale-positive", "gate-first", "mutation-first", "beforeidentity", "failed-SQL"])
+    test(`D1 admission ${operation}: ${schedule}`, { timeout: 30_000 }, async (t) => {
+      const f = await persistenceFixture(t, { realtime: true });
+      for (const user of ["owner", "member", "stranger"]) assert.equal((await f.request("/api/files/shared", user, "PUT", scene)).status, 200);
+      const id = (await f.request("/api/diagrams", "owner")).body.diagrams[0].id;
+      const other = (await f.request("/api/diagrams", "stranger")).body.diagrams[0].id;
+      const route = `/api/diagrams/${id}`, target = operation === "owner" ? "owner" : "member";
+      assert.equal((await f.request(`${route}/members`, "owner", "POST", { username: "member" })).status, 201);
+      const snapshot = async () => ({ documents: await f.snapshot(id, "shared"),
+        accounts: await f.request("/api/admin/users", "admin"), members: await f.request(`${route}/members`, "owner"), tree: await admissionTree(f.directory) });
+      const before = await snapshot();
+      const mutationRoute = operation === "member" ? `${route}/members/member` : operation === "diagram" ? "/api/files/shared" : `/api/admin/users/${f.users[target]}`;
+      const stage = schedule === "gate-first" ? "gate" : schedule === "mutation-first" ? "before" : schedule === "beforeidentity" ? "identity" : "positive";
+      const sid = decodeURIComponent(f.cookieFor("member").split("=")[1]).slice(2).split(".")[0];
+      const control = (action, options = {}) => f.realtimeControl(action, { admission: true, ...options });
+      const fault = await control("arm", { stage, sid, room: id, operation, target: String(f.users[target]), fail: schedule === "failed-SQL" });
+      const raw = pendingRealtimeUpgrade(id, f.cookieFor("member"));
+      let mutation, denial;
+      try {
+        const observed = await fault.observed;
+        assert.ok(observed, stage === "gate" ? "D1 missing authoritative SHARE admission gate" : "D1 selected admission SQL barrier missing");
+        assert.deepEqual({ hits: observed.admissionHits, ready: observed.ready }, { hits: 1, ready: 0 }, "D1 one-shot admission proof must precede ready");
+        if (stage !== "before") assert.equal(observed.positive, true, "D1 consumed a real positive SQL result");
+        // A distinct authenticated pending join progresses while only the selected SID/room is held.
+        const unrelated = await realtimeResult(other, { cookie: f.cookieFor("stranger") });
+        assert.equal(unrelated.status, 101); assert.deepEqual(JSON.parse(unrelated.body), { type: "ready", diagramId: other });
+        mutation = f.request(mutationRoute, operation === "member" || operation === "diagram" ? "owner" : "admin", "DELETE");
+        if (stage === "gate") {
+          await f.blocked(1); // Actual PG lock wait, not absence of HTTP completion.
+          await control("release", { stage: "admission" });
+          await admissionReady(raw, id);
+        }
+        const committed = await fault.mutation;
+        assert.ok(committed, "D1 selected mutation SQL did not settle");
+        assert.equal(committed.mutationHits, 1);
+        if (schedule === "failed-SQL") {
+          const result = await mutation;
+          assert.equal(result.status, 500); assert.deepEqual(result.body, { error: "Se produjo un error interno en el servidor." });
+          assert.deepEqual(await snapshot(), before);
+          await control("release", { stage: "admission" });
+          await admissionReady(raw, id);
+          const a = realtimePeer(id, f.cookieFor("member")), b = realtimePeer(id, f.cookieFor("owner"));
+          try { await a.next(); await b.next(); await relay(a, b, f.users.member); await relay(b, a, f.users.owner); }
+          finally { await Promise.all([a.dispose(), b.dispose()]); }
+          const status = await control("status");
+          assert.equal(f.streams().stderr, status.expectedError, "D1 only exact injected DELETE error logged");
+          assert.deepEqual(await snapshot(), before);
+        } else {
+          assert.equal(committed.mutationSettled, 1, "D1 actual canonical DELETE row settled before route delivery");
+          assert.deepEqual(await admissionTree(f.directory), before.tree, "D1 no filesystem cleanup before SQL result delivery");
+          const access = await f.request(route, "member");
+          assert.equal(access.status, 404); assert.deepEqual(access.body, { error: "El diagrama solicitado no existe." });
+          const accounts = await f.request("/api/admin/users", "admin");
+          assert.equal(accounts.status, 200);
+          assert.deepEqual(accounts.body, { users: before.accounts.body.users.filter((user) =>
+            !["actor", "owner"].includes(operation) || user.username !== target).map((user) =>
+            operation === "diagram" && user.username === "owner" ? { ...user, diagramCount: user.diagramCount - 1 } : user) });
+          const ownerAccess = await f.request(route, "owner");
+          assert.deepEqual({ status: ownerAccess.status, body: ownerAccess.body, etag: ownerAccess.etag },
+            ["member", "actor"].includes(operation) ? before.documents[`owner:${route}`] :
+              { status: 404, body: access.body, etag: access.etag });
+          if (["member", "actor"].includes(operation)) assert.deepEqual((await f.request(`${route}/members`, "owner")).body, { members: [] });
+          if (stage !== "gate") {
+            await control("release", { stage: "admission" });
+            denial = await raw.waitEnd().then(() => null, (error) => error);
+          }
+          await control("release", { stage: "mutation" });
+          const result = await mutation;
+          assert.equal(result.status, 200);
+          assert.deepEqual(result.body, operation === "member" ? { ok: true } : operation === "diagram" ?
+            { ok: true, file: { name: "shared", fileName: "shared.excalidraw.json" } } :
+            { ok: true, user: { id: String(f.users[target]), username: target } });
+          const removed = operation === "member" ? null : f.backups.relative(operation === "diagram" ? "owner" : target, operation === "diagram" ? "shared" : undefined);
+          const expectedTree = Object.fromEntries(Object.entries(before.tree).filter(([name]) => !removed || (name !== removed && !name.startsWith(removed + "/"))));
+          assert.deepEqual(await admissionTree(f.directory), expectedTree, "D1 exact backup bytes and directory effects");
+          assert.equal(f.streams().stderr, "");
+          if (stage !== "gate") {
+            assert.doesNotMatch(raw.state().response, /HTTP\/1\.1 101|"type":"ready"/, "D1 no late101-ready after canonical DELETE");
+            assert.equal(denial, null, "D1 denied admission transport must end after release");
+            assert.match(raw.state().response, operation === "actor" ? /HTTP\/1\.1 401/ : /HTTP\/1\.1 404/);
+          }
+        }
+      } finally {
+        await control("release"); // Disarm and release BOTH holds before awaiting SQL or destroying sockets.
+        try {
+          if (mutation) await mutation;
+          const settled = await fault.settled;
+          assert.ok(settled, "D1 all selected SQL and borrowed clients settled before teardown");
+          assert.equal(settled.earlyRelease, 0);
+          if (settled.admissionHits) assert.equal(settled.queryDone, true);
+          if (stage === "gate" && settled.clientReleased) assert.equal(settled.rollbackAfterReady, true, "D1 ready enqueued before ROLLBACK released SHARE locks");
+          assert.deepEqual(raw.state().errors, []);
+        } finally { fault.cancel(); raw.dispose(); }
+      }
+    });

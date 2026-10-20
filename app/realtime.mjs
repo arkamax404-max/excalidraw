@@ -190,6 +190,7 @@ export const attachRealtime = (server, { sessionMiddleware, pool, schema, sessio
     socket.on("error", onError).once("timeout", onTimeout).once("close", cleanup);
     socket.setTimeout(5000);
     const deny = (status) => rejectUpgrade(socket, status);
+    let admitted;
     const authorize = async () => {
       const match = /^\/api\/realtime\/diagrams\/([^/?]+)$/.exec(request.url);
       if (!match) return deny(404);
@@ -215,36 +216,51 @@ export const attachRealtime = (server, { sessionMiddleware, pool, schema, sessio
       if (!access.rowCount) return deny(401);
       if (!canonicalId(id)) return deny(400);
       if (!access.rows[0].allowed) return deny(404);
-      realtime.handleUpgrade(request, socket, head, (client) => {
-        cleanup();
-        socket.setTimeout(0);
-        // Preserve ws protocol close codes (notably 1009) instead of destroying their close frame.
-        client.on("error", () => { if (client.readyState === 1) client.close(1008, "Transport error"); });
-        const peer = { socket: client, actor, sid: request.sessionID, id, peerId: randomUUID(), queue: [], bytes: 0, busy: false };
-        peer.authorizedAt = performance.now();
-        peer.auditPending = false;
-        peers.add(peer);
-        peer.watchdog = setInterval(() => {
-          if (!live(peer)) return;
-          if (performance.now() - peer.authorizedAt >= 5000) return close(peer);
-          if (!peer.auditPending) void audit(peer);
-        }, 1000);
-        peer.watchdog.unref();
-        client.once("close", () => {
-          clearInterval(peer.watchdog);
-          clearTimeout(peer.reaper);
-          peers.delete(peer); peer.queue.length = 0; peer.bytes = 0;
+      const identity = { actor, sid: request.sessionID, id };
+      const accept = ({ owner, room, active, authenticated, valid }) => {
+        if (stopped || socket.destroyed) return;
+        if (!authenticated(identity)) return deny(401);
+        if (!room || room.user_id !== owner || !active(owner) || !valid(identity)) return deny(404);
+        // Installed ws completes upgrade/ready synchronously with compression/verifyClient disabled.
+        realtime.handleUpgrade(request, socket, head, (client) => {
+          cleanup();
+          socket.setTimeout(0);
+          // Preserve ws protocol close codes (notably 1009) instead of destroying their close frame.
+          client.on("error", () => { if (client.readyState === 1) client.close(1008, "Transport error"); });
+          const peer = { socket: client, actor, sid: request.sessionID, id, peerId: randomUUID(), queue: [], bytes: 0, busy: false };
+          peer.authorizedAt = performance.now();
+          peer.auditPending = false;
+          admitted = peer;
+          peers.add(peer);
+          peer.watchdog = setInterval(() => {
+            if (!live(peer)) return;
+            if (performance.now() - peer.authorizedAt >= 5000) return close(peer);
+            if (!peer.auditPending) void audit(peer);
+          }, 1000);
+          peer.watchdog.unref();
+          client.once("close", () => {
+            clearInterval(peer.watchdog);
+            clearTimeout(peer.reaper);
+            peers.delete(peer); peer.queue.length = 0; peer.bytes = 0;
+          });
+          client.on("message", (data, binary) => {
+            if (!live(peer)) return;
+            if (peer.queue.length >= 8 || peer.bytes + data.length > limit) return close(peer, 1013, "Queue overloaded");
+            peer.queue.push({ data, binary }); peer.bytes += data.length;
+            if (!peer.busy) void drain(peer);
+          });
+          client.send(JSON.stringify({ type: "ready", diagramId: id }));
         });
-        client.on("message", (data, binary) => {
-          if (!live(peer)) return;
-          if (peer.queue.length >= 8 || peer.bytes + data.length > limit) return close(peer, 1013, "Queue overloaded");
-          peer.queue.push({ data, binary }); peer.bytes += data.length;
-          if (!peer.busy) void drain(peer);
-        });
-        client.send(JSON.stringify({ type: "ready", diagramId: id }));
+      };
+      await authorizeLocked(identity, undefined, accept, () => {
+        if (admitted) close(admitted);
+        else deny(500);
       });
     };
-    void authorize().catch(() => deny(500));
+    void authorize().catch(() => {
+      if (admitted) close(admitted);
+      else deny(500);
+    });
   };
   server.on("upgrade", upgrade);
   const nativeClose = server.close;

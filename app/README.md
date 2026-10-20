@@ -105,6 +105,13 @@ body: 401 for missing/invalid sessions or inactive actors, 400 for invalid IDs,
 or mismatched Origin. Internal failures return an empty 500; malformed WebSocket
 handshakes return an empty 400. Origin is checked before session and room access.
 
+Initial admission reuses the delivery SHARE-lock gate: fresh SID identity/expiry,
+active actor/owner and membership remain locked through synchronous upgrade, peer
+registration and ready enqueue. The preliminary access query preserves denial statuses
+but is not admission authority. ROLLBACK settles before the borrowed client is released,
+including denial, shutdown and error paths; failed authorization never upgrades.
+Canonical-DELETE immediate retirement remains a separate T4d2 delivery.
+
 Clients may send exactly `{"type":"sync_request","payload":{}}` or
 `{"type":"scene","payload":{"elements":[...]}}`. Other peers in the
 same room receive that type/payload plus `sender:{userId,peerId}`: the exact account ID
