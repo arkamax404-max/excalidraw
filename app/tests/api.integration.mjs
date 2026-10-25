@@ -255,6 +255,95 @@ for (const cleanupFails of [false, true]) {
   });
 }
 
+for (const cleanupFails of [false, true]) {
+  test(cleanupFails
+    ? "admin account DELETE retires owned-diagram transports before failing directory cleanup"
+    : "admin account DELETE promptly retires only owned-diagram transports before directory cleanup", { timeout: 60_000 }, async (t) => {
+    const f = await persistenceFixture(t);
+    const ownedNames = ["account-target-a", "account-target-b"];
+    const owned = [];
+    for (const name of ownedNames) {
+      assert.equal((await f.request(`/api/files/${name}`, "owner", "PUT", scene)).status, 200);
+      const listed = await f.request("/api/diagrams", "owner");
+      assert.equal(listed.status, 200);
+      const diagram = listed.body.diagrams.find((entry) => entry.name === name);
+      assert.ok(diagram, `Missing account deletion fixture diagram: ${name}`);
+      owned.push(diagram.id);
+      assert.equal((await f.request(`/api/diagrams/${diagram.id}/members`, "owner", "POST",
+        { username: "member" })).status, 201);
+    }
+    assert.equal((await f.request("/api/files/account-control", "stranger", "PUT", scene)).status, 200);
+    const listed = await f.request("/api/diagrams", "stranger");
+    assert.equal(listed.status, 200);
+    const control = listed.body.diagrams.find((entry) => entry.name === "account-control");
+    assert.ok(control, "Missing other account's control diagram");
+    assert.equal((await f.request(`/api/diagrams/${control.id}/members`, "stranger", "POST",
+      { username: "member" })).status, 201);
+    const expectedFiles = ownedNames.map((name) => `${name}.excalidraw.json`).sort();
+    const barrier = await f.storageBarrier("rm", f.backups.relative("owner"), cleanupFails);
+    const peers = [];
+    const open = async (id, user, deadlineMs = 3000) => {
+      const peer = realtimePeer(id, f.cookieFor(user), { deadlineMs,
+        deadlineMessage: `${user}'s account-deletion transport event missing within ${deadlineMs} ms` });
+      peers.push(peer);
+      const ready = await peer.next();
+      assert.equal(ready.type, "message");
+      assert.deepEqual(JSON.parse(ready.data.toString("utf8")), { type: "ready", diagramId: id });
+      return { peer, readyAt: performance.now(), user };
+    };
+    try {
+      const controlOwner = await open(control.id, "stranger");
+      const controlMember = await open(control.id, "member");
+      const affected = [];
+      for (const id of owned) {
+        for (const user of ["owner", "member"]) affected.push(await open(id, user, 750));
+      }
+      const startedAt = performance.now();
+      const retired = Promise.all(affected.map(async ({ peer, readyAt, user }) => {
+        const event = await peer.next();
+        const observedAt = performance.now();
+        assert.equal(event.type, "close", `${user}'s deleted-account diagram transport must emit close`);
+        assert.ok(observedAt - startedAt < 750,
+          `${user}'s close must occur within 750 ms of starting admin account DELETE`);
+        assert.ok(observedAt - readyAt < 2000,
+          `${user}'s close must occur within 2000 ms of ready, excluding the five-second watchdog`);
+      }));
+      const deletion = f.request(`/api/admin/users/${f.users.owner}`, "admin", "DELETE");
+      const [response] = await Promise.all([deletion, retired, (async () => {
+        try {
+          await Promise.all([barrier.blocked, retired]);
+          const accounts = await f.request("/api/admin/users", "admin");
+          assert.equal(accounts.status, 200);
+          assert.equal(accounts.body.users.some((user) => String(user.id) === String(f.users.owner)), false,
+            "Account deletion must be confirmed while directory removal is blocked");
+          assert.deepEqual((await readdir(f.backups.directory("owner"))).sort(), expectedFiles,
+            "Owned transports must close before the account directory is removed");
+        } finally { barrier.release(); }
+      })()]);
+      expectResponse(response, cleanupFails ? 500 : 200, cleanupFails
+        ? { error: "Se produjo un error interno en el servidor." }
+        : { ok: true, user: { id: f.users.owner, username: "owner" } });
+      if (cleanupFails) {
+        assert.deepEqual((await readdir(f.backups.directory("owner"))).sort(), expectedFiles);
+      } else {
+        await assert.rejects(readdir(f.backups.directory("owner")), { code: "ENOENT" });
+      }
+      controlOwner.peer.send({ type: "sync_request", payload: {} });
+      const event = await controlMember.peer.next();
+      assert.equal(event.type, "message", "Other account's transport must still receive broadcasts after deletion");
+      assert.equal(event.binary, false);
+      const frame = JSON.parse(event.data.toString("utf8"));
+      assert.equal(frame.type, "sync_request");
+      assert.deepEqual(frame.payload, {});
+      assert.equal(frame.sender.userId, String(f.users.stranger));
+      assert.deepEqual(await readdir(f.backups.directory("stranger")), ["account-control.excalidraw.json"]);
+    } finally {
+      barrier.release();
+      await Promise.all(peers.map((peer) => peer.dispose()));
+    }
+  });
+}
+
 test("membership revocation promptly closes only the revoked member's diagram connection", { timeout: 60_000 }, async (t) => {
   const f = await persistenceFixture(t);
   const rooms = [];

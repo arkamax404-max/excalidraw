@@ -225,7 +225,7 @@ test("sync_request has a current private bounded delivery gate", { timeout: 240_
     await mutate(f, route); await checkpoint();
     if (recipient && !name.includes("owner") && name !== "deleted diagram") {
       const valid = await open("owner"); await relay(a, valid, f.users.owner);
-    } else if (recipient && name !== "deleted diagram") a.send(sync);
+    } else if (recipient && name !== "deleted diagram" && name !== "deleted owner") a.send(sync);
     if (b.open) b.send(sync); await closed(b, 1008); // Bounds absence even if invalidation already closed it.
     if (a.open) a.send("unsupported"); await closed(a, 1008);
     await relay(c, d, f.users.stranger); // Unaffected peers must still work.

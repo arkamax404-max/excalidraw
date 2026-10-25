@@ -497,6 +497,10 @@ app.delete("/api/admin/users/:id", requireAdmin, async (request, response, next)
     const key = directoryLockKey(initial.id);
     await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [key]);
     lockKey = key;
+    const ownedDiagrams = await client.query(
+      `SELECT id FROM ${DB_SCHEMA}.diagrams WHERE user_id = $1`,
+      [initial.id],
+    );
     const result = await client.query(
       `
         DELETE FROM ${DB_SCHEMA}.users
@@ -511,6 +515,9 @@ app.delete("/api/admin/users/:id", requireAdmin, async (request, response, next)
       return;
     }
 
+    for (const { id } of ownedDiagrams.rows) {
+      realtime.retireDiagram(id);
+    }
     await deleteUserDataDir(result.rows[0].id);
 
     response.json({
