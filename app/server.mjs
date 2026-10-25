@@ -929,7 +929,7 @@ app.delete("/api/files/:name", requireAuth, async (request, response, next) => {
         USING ${DB_SCHEMA}.users AS owner
         WHERE diagrams.user_id = $1 AND diagrams.name = $2 AND owner.id = diagrams.user_id
           AND owner.username = $3
-        RETURNING diagrams.name, owner.id AS owner_id
+        RETURNING diagrams.id, diagrams.name, owner.id AS owner_id
       `,
       [initial.id, name, initial.username],
     );
@@ -939,6 +939,7 @@ app.delete("/api/files/:name", requireAuth, async (request, response, next) => {
       return;
     }
 
+    realtime.retireDiagram(result.rows[0].id);
     await deleteDiagramBackup(result.rows[0].owner_id, name);
 
     response.json({

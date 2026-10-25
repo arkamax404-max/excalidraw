@@ -188,6 +188,73 @@ test("authentication and private diagram storage baseline", { timeout: 60_000 },
   });
 });
 
+for (const cleanupFails of [false, true]) {
+  test(cleanupFails
+    ? "owner DELETE retires diagram transports before failing backup cleanup"
+    : "owner DELETE promptly retires only the deleted diagram's transports", { timeout: 60_000 }, async (t) => {
+    const f = await persistenceFixture(t);
+    const rooms = [];
+    for (const name of ["delete-target", "delete-control"]) {
+      assert.equal((await f.request(`/api/files/${name}`, "owner", "PUT", scene)).status, 200);
+      const listed = await f.request("/api/diagrams", "owner");
+      assert.equal(listed.status, 200);
+      const diagram = listed.body.diagrams.find((entry) => entry.name === name);
+      assert.ok(diagram, `Missing deletion fixture diagram: ${name}`);
+      rooms.push(diagram.id);
+    }
+    const [target, control] = rooms;
+    assert.equal((await f.request(`/api/diagrams/${target}/members`, "owner", "POST",
+      { username: "member" })).status, 201);
+    // Hold and fail the actual unlink through the public fixture, without permissions assumptions.
+    const barrier = cleanupFails
+      ? await f.storageBarrier("unlink", f.backups.relative("owner", "delete-target"), true) : null;
+    const peers = [];
+    const open = async (id, user) => {
+      const peer = realtimePeer(id, f.cookieFor(user), { deadlineMs: 750,
+        deadlineMessage: `${user} deletion transport event missing within 750 ms` });
+      peers.push(peer);
+      const ready = await peer.next();
+      assert.equal(ready.type, "message");
+      assert.deepEqual(JSON.parse(ready.data.toString("utf8")), { type: "ready", diagramId: id });
+      return { peer, readyAt: performance.now(), user };
+    };
+    try {
+      const other = await open(control, "owner");
+      const affected = [await open(target, "owner"), await open(target, "member")];
+      const startedAt = performance.now();
+      const retired = Promise.all(affected.map(async ({ peer, readyAt, user }) => {
+        const event = await peer.next();
+        const observedAt = performance.now();
+        assert.equal(event.type, "close", `${user}'s deleted-diagram transport must emit close`);
+        assert.ok(observedAt - startedAt < 750,
+          `${user}'s close must occur within 750 ms of starting DELETE`);
+        assert.ok(observedAt - readyAt < 2000,
+          `${user}'s close must occur within 2000 ms of ready, excluding the five-second watchdog`);
+        assert.equal(peer.open, false);
+      }));
+      const deletion = f.request("/api/files/delete-target", "owner", "DELETE");
+      // Consume all branches immediately; release cleanup even if retirement fails.
+      const [response] = await Promise.all([deletion, retired, (async () => {
+        if (!barrier) return;
+        try {
+          await Promise.all([barrier.blocked, retired]);
+          assert.equal(other.peer.open, true, "Diagram B must stay open while A cleanup is blocked");
+        } finally { barrier.release(); }
+      })()]);
+      expectResponse(response, cleanupFails ? 500 : 200, cleanupFails
+        ? { error: "Se produjo un error interno en el servidor." }
+        : { ok: true, file: { name: "delete-target", fileName: "delete-target.excalidraw.json" } });
+      assert.equal(other.peer.open, true, "Deleting diagram A must leave diagram B's transport open");
+      assert.deepEqual((await readdir(f.backups.directory("owner"))).sort(), cleanupFails
+        ? ["delete-control.excalidraw.json", "delete-target.excalidraw.json"]
+        : ["delete-control.excalidraw.json"]);
+    } finally {
+      barrier?.release();
+      await Promise.all(peers.map((peer) => peer.dispose()));
+    }
+  });
+}
+
 test("membership revocation promptly closes only the revoked member's diagram connection", { timeout: 60_000 }, async (t) => {
   const f = await persistenceFixture(t);
   const rooms = [];

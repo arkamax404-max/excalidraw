@@ -281,5 +281,10 @@ export const attachRealtime = (server, { sessionMiddleware, pool, schema, sessio
         if (peer.actor === actor && peer.id === id) close(peer);
       }
     },
+    retireDiagram(id) {
+      for (const peer of peers) {
+        if (peer.id === id) close(peer);
+      }
+    },
   };
 };
