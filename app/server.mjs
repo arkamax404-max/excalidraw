@@ -826,6 +826,7 @@ const changeMembership = async (request, response, next) => {
         response.status(404).json({ error: "La membresia solicitada no existe." });
         return;
       }
+      realtime.retire(user.id, request.params.id);
       response.json({ ok: true });
     }
   } catch (error) { next(error); }
@@ -985,5 +986,5 @@ const server = app.listen(PORT, () => {
   console.log(`PostgreSQL schema: ${DB_SCHEMA}`);
   console.log(`Data directory: ${DATA_DIR}`);
 });
-attachRealtime(server, { sessionMiddleware, pool, schema: DB_SCHEMA, sessionTable,
+const realtime = attachRealtime(server, { sessionMiddleware, pool, schema: DB_SCHEMA, sessionTable,
   trustProxy: app.get("trust proxy fn") });

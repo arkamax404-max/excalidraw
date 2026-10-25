@@ -8,6 +8,8 @@ import test from "node:test";
 import bcrypt from "bcryptjs";
 import pg from "pg";
 import { backupPaths } from "./helpers/backup-paths.mjs";
+import { persistenceFixture } from "./helpers/persistence-fixture.mjs";
+import { realtimePeer } from "./helpers/realtime-peer.mjs";
 
 // Run only via the disposable Docker runner, not against a developer's database.
 assert.equal(process.env.API_TEST_ISOLATED, "1", "Use npm run test:api");
@@ -184,4 +186,75 @@ test("authentication and private diagram storage baseline", { timeout: 60_000 },
     assert.deepEqual(await readdir(backups.directory("alice")), []);
     expectResponse(await request("/api/files/private-diagram", { cookie: bob }), 200, bobBefore.body);
   });
+});
+
+test("membership revocation promptly closes only the revoked member's diagram connection", { timeout: 60_000 }, async (t) => {
+  const f = await persistenceFixture(t);
+  const rooms = [];
+  for (const name of ["revocation-target", "revocation-control"]) {
+    assert.equal((await f.request(`/api/files/${name}`, "owner", "PUT", scene)).status, 200);
+    const listed = await f.request("/api/diagrams", "owner");
+    assert.equal(listed.status, 200);
+    const diagram = listed.body.diagrams.find((entry) => entry.name === name);
+    assert.ok(diagram, `Missing revocation fixture diagram: ${name}`);
+    rooms.push(diagram.id);
+    assert.equal((await f.request(`/api/diagrams/${diagram.id}/members`, "owner", "POST",
+      { username: "member" })).status, 201);
+  }
+  const [target, control] = rooms;
+  assert.equal((await f.request(`/api/diagrams/${target}/members`, "owner", "POST",
+    { username: "stranger" })).status, 201);
+
+  const peers = [];
+  const open = async (room, user, deadlineMs = 3000, deadlineMessage) => {
+    const peer = realtimePeer(room, f.cookieFor(user), { deadlineMs, deadlineMessage });
+    peers.push(peer);
+    const ready = await peer.next();
+    assert.equal(ready.type, "message", `${user} must receive ready on diagram ${room}`);
+    assert.deepEqual(JSON.parse(ready.data.toString("utf8")), { type: "ready", diagramId: room });
+    return peer;
+  };
+  const expectBroadcast = async (peer, sender, message) => {
+    const event = await peer.next();
+    assert.equal(event.type, "message", message);
+    assert.equal(event.binary, false, message);
+    const frame = JSON.parse(event.data.toString("utf8"));
+    assert.equal(frame.type, "sync_request", message);
+    assert.deepEqual(frame.payload, {}, message);
+    assert.equal(frame.sender.userId, String(f.users[sender]), message);
+    assert.ok(frame.sender.peerId, message);
+  };
+  try {
+    const targetOwner = await open(target, "owner");
+    const survivor = await open(target, "stranger", 3000,
+      "Surviving member did not receive the post-revocation broadcast");
+    const controlOwner = await open(control, "owner");
+    const controlMember = await open(control, "member", 3000,
+      "Revoked member's connection on the second diagram did not receive a broadcast");
+    // Open last; bound total age to 2000 ms so even a slow DELETE cannot let
+    // the approximately five-second authorization watchdog explain the close.
+    const revoked = await open(target, "member", 750,
+      "Revoked member's socket did not emit close within 750 ms of successful revocation");
+    const revokedReadyAt = performance.now();
+    assert.equal((await f.request(`/api/diagrams/${target}/members/member`, "owner", "DELETE")).status, 200,
+      "Owner must successfully revoke the target diagram membership");
+    const revokedDeletedAt = performance.now();
+    const closed = await revoked.next();
+    const closeObservedAt = performance.now();
+    assert.ok(closeObservedAt - revokedDeletedAt < 750,
+      "Revoked member's close must be observed within 750 ms after successful DELETE");
+    assert.ok(closeObservedAt - revokedReadyAt < 2000,
+      "Revoked member's close must be observed within 2000 ms of ready to exclude watchdog expiry");
+    assert.equal(closed.type, "close", "Revoked member must emit close, not another application frame");
+    assert.equal(revoked.open, false, "Revoked member must no longer have an open target connection");
+
+    targetOwner.send({ type: "sync_request", payload: {} });
+    await expectBroadcast(survivor, "owner", "Surviving member must receive the post-revocation broadcast");
+    assert.equal(survivor.open, true, "Other members on the target diagram must remain connected");
+    controlOwner.send({ type: "sync_request", payload: {} });
+    await expectBroadcast(controlMember, "owner", "Same member's second-diagram connection must remain usable");
+    assert.equal(controlMember.open, true, "Revocation must not close the same member's second-diagram connection");
+  } finally {
+    await Promise.all(peers.map((peer) => peer.dispose()));
+  }
 });

@@ -275,4 +275,11 @@ export const attachRealtime = (server, { sessionMiddleware, pool, schema, sessio
     for (const peer of peers) { clearInterval(peer.watchdog); close(peer); }
     return result;
   };
+  return {
+    retire(actor, id) {
+      for (const peer of peers) {
+        if (peer.actor === actor && peer.id === id) close(peer);
+      }
+    },
+  };
 };
