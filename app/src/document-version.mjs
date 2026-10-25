@@ -7,6 +7,9 @@ export const documentContext = (account, name, previous) => ({
 });
 export const renameDocument = (state, name) => ({ ...state, name, generation: state.generation + 1 });
 export const beginDocumentOperation = (state) => ({ ...state, generation: state.generation + 1 });
+export const beginReconciliation = (state) => ({ state, generation: state.generation });
+export const canApplyServerDocument = (current, token) =>
+  current === token.state && current.generation === token.generation;
 export const documentHeaders = (state) => state.account && state.identity?.name === normalizeDocumentName(state.name)
   ? { "If-Match": state.identity.etag } : {};
 

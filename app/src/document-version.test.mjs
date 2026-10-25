@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { normalizeDocumentName, documentContext, renameDocument, beginDocumentOperation,
-  documentHeaders, acknowledgeDocument, readApiResponse, documentError } from "./document-version.mjs";
+  documentHeaders, acknowledgeDocument, readApiResponse, documentError,
+  beginReconciliation, canApplyServerDocument } from "./document-version.mjs";
 
 const reply = (etag = '"9007199254740993:2"', warning) => ({
   payload: { file: { name: "one", fileName: "one.excalidraw" }, warning },
@@ -57,6 +58,47 @@ test("name, new/load generations and blank/logout/account/delete reject late ack
   });
   assert.equal(savedAs.name, "fresh-name");
   assert.deepEqual(documentHeaders(savedAs), { "If-Match": '"42:1"' });
+});
+
+test("reconciliation token authorises its unchanged document state", () => {
+  const state = loaded();
+  const token = beginReconciliation(state);
+  assert.equal(canApplyServerDocument(state, token), true);
+});
+
+test("new local operation rejects reconciliation and preserves local scene", () => {
+  const state = loaded();
+  const token = beginReconciliation(state);
+  const localScene = { elements: [{ id: "local-edit" }] };
+  const current = { ...beginDocumentOperation(state), scene: localScene };
+  assert.equal(canApplyServerDocument(current, token), false);
+  assert.strictEqual(current.scene, localScene);
+  assert.deepEqual(current.scene, { elements: [{ id: "local-edit" }] });
+});
+
+test("rename and document switch invalidate reconciliation", () => {
+  const state = loaded();
+  const token = beginReconciliation(state);
+  for (const current of [renameDocument(state, "two"),
+    documentContext("alice", "two", state), documentContext("alice", "one", state)]) {
+    assert.equal(canApplyServerDocument(current, token), false);
+  }
+});
+
+test("reconciliation token never authorises another document at the same generation", () => {
+  const state = documentContext("alice", "one");
+  const token = beginReconciliation(state);
+  for (const other of [documentContext("alice", "two"), documentContext("bob", "one")]) {
+    assert.equal(other.generation, state.generation);
+    assert.equal(canApplyServerDocument(other, token), false);
+  }
+});
+
+test("same document state mutated in place invalidates reconciliation", () => {
+  const state = loaded();
+  const token = beginReconciliation(state);
+  state.generation += 1;
+  assert.equal(canApplyServerDocument(state, token), false);
 });
 
 test("default HTTP response semantics stay JSON/null with original errors; metadata is opt-in", async () => {

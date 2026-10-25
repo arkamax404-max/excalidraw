@@ -12,7 +12,8 @@ import { convertAndInsertMermaid } from "./ai/mermaidToScene.js";
 
 import { serializeScene } from "./scene-serialization.mjs";
 import { documentContext, renameDocument, beginDocumentOperation, documentHeaders,
-  acknowledgeDocument, readApiResponse, documentError, normalizeDocumentName } from "./document-version.mjs";
+  acknowledgeDocument, readApiResponse, documentError, normalizeDocumentName,
+  beginReconciliation, canApplyServerDocument } from "./document-version.mjs";
 
 const DEFAULT_FILE_NAME = "diagrama-1";
 const ADMIN_FORM_INITIAL_STATE = {
@@ -67,6 +68,16 @@ function App() {
   const [aiError, setAiError] = useState("");
   const aiAbortController = useRef(null);
   const documentVersion = useRef(documentContext(null, DEFAULT_FILE_NAME));
+  const saveConflict = useRef(null);
+  const pendingReconciliation = useRef(null);
+  const trackReconciliationChanges = useCallback((elements, appState, files) => {
+    const pending = pendingReconciliation.current;
+    if (pending && canApplyServerDocument(documentVersion.current, pending.token)
+      && serializeScene(elements, appState, files, serializeAsJSON) !== pending.scene) {
+      // Keep request ownership (including HTTP errors), but invalidate its snapshot.
+      documentVersion.current.generation += 1;
+    }
+  }, []);
   const resetDocumentIdentity = (account, name = DEFAULT_FILE_NAME) => {
     documentVersion.current = documentContext(account, name, documentVersion.current);
   };
@@ -260,7 +271,10 @@ function App() {
         `Guardado como ${result.payload.file.fileName}.${result.warning ? " PostgreSQL confirmado; fallo el respaldo." : ""}${!next.identity ? " Falta la version: carga el diagrama antes de reemplazarlo." : ""}`));
       await refreshFiles();
     } catch (error) {
-      if (documentVersion.current === operation) setStatus(createStatus("error", documentError(error)));
+      if (documentVersion.current === operation) {
+        if (error.status === 412 || error.status === 428) saveConflict.current = operation;
+        setStatus(createStatus("error", documentError(error)));
+      }
     } finally {
       setBusy(false);
     }
@@ -277,11 +291,25 @@ function App() {
       const previous = documentVersion.current;
       const operation = beginDocumentOperation(renameDocument(previous, name));
       documentVersion.current = operation;
+      const reconciliation = saveConflict.current === previous
+        && normalizeDocumentName(name) === normalizeDocumentName(previous.name)
+        ? {
+          token: beginReconciliation(operation),
+          scene: serializeScene(excalidrawAPI.getSceneElementsIncludingDeleted(),
+            excalidrawAPI.getAppState(), excalidrawAPI.getFiles(), serializeAsJSON),
+        } : null;
+      pendingReconciliation.current = reconciliation;
+      if (reconciliation) saveConflict.current = operation;
 
       try {
         const result = await apiRequest(`/api/files/${encodeURIComponent(name)}`, {}, true, operation);
+        if (reconciliation && !canApplyServerDocument(documentVersion.current, reconciliation.token)) {
+          setStatus(createStatus("info", "El lienzo conserva los cambios locales porque cambio mientras se cargaba la version del servidor."));
+          return;
+        }
         const next = acknowledgeDocument(documentVersion.current, operation, result);
         if (!next) return;
+        pendingReconciliation.current = null;
         documentVersion.current = next;
         const payload = result.payload;
         const scene = payload.scene ?? {};
@@ -306,6 +334,7 @@ function App() {
           setStatus(createStatus("error", documentError(error)));
         }
       } finally {
+        if (pendingReconciliation.current === reconciliation) pendingReconciliation.current = null;
         setBusy(false);
       }
     },
@@ -662,6 +691,7 @@ function App() {
       <main className="editor-shell">
         <Excalidraw
           excalidrawAPI={setExcalidrawAPI}
+          onChange={trackReconciliationChanges}
           name={currentFileName}
           renderTopRightUI={renderTopRightUI}
           UIOptions={{
