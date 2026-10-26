@@ -16,6 +16,7 @@ import { documentContext, renameDocument, beginDocumentOperation, documentHeader
   acknowledgeDocument, readApiResponse, documentError, normalizeDocumentName,
   beginReconciliation, canApplyServerDocument, documentTarget,
   documentPayloadName } from "./document-version.mjs";
+import { validUsername, sharePath, memberPath, memberNames } from "./sharing.mjs";
 
 const DEFAULT_FILE_NAME = "diagrama-1";
 const ADMIN_FORM_INITIAL_STATE = {
@@ -55,6 +56,10 @@ function App() {
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
   const [fileName, setFileName] = useState(DEFAULT_FILE_NAME);
+  const [loadedIdentity, setLoadedIdentity] = useState(null);
+  const [shareUsername, setShareUsername] = useState("");
+  const [members, setMembers] = useState([]);
+  const [shareBusy, setShareBusy] = useState(false);
   const [availableFiles, setAvailableFiles] = useState([]);
   const [busy, setBusy] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
@@ -122,6 +127,9 @@ function App() {
   const resetDocumentIdentity = (account, name = DEFAULT_FILE_NAME) => {
     closeRealtime();
     documentVersion.current = documentContext(account, name, documentVersion.current);
+    setLoadedIdentity(null);
+    setMembers([]);
+    setShareUsername("");
   };
 
   const currentFileName = useMemo(() => {
@@ -187,6 +195,60 @@ function App() {
       }
     }
   }, [apiRequest, authUser]);
+
+  const loadMembers = useCallback(async (identity) => {
+    const path = sharePath(identity);
+    if (!path) {
+      setMembers([]);
+      return;
+    }
+    try {
+      setMembers(memberNames(await apiRequest(path)));
+    } catch (error) {
+      if (error.status !== 401) {
+        setStatus(createStatus("error", error.message));
+      }
+    }
+  }, [apiRequest]);
+
+  const shareMember = useCallback(async () => {
+    const path = sharePath(loadedIdentity);
+    const username = shareUsername.trim();
+    if (!path || !validUsername(username)) {
+      setStatus(createStatus("error", "Escribe un usuario valido para compartir."));
+      return;
+    }
+    setShareBusy(true);
+    try {
+      await apiRequest(path, { method: "POST", body: JSON.stringify({ username }) });
+      setShareUsername("");
+      setStatus(createStatus("success", `${username} ya puede abrir este diagrama.`));
+      await loadMembers(loadedIdentity);
+    } catch (error) {
+      if (error.status !== 401) {
+        setStatus(createStatus("error", error.message));
+      }
+    } finally {
+      setShareBusy(false);
+    }
+  }, [apiRequest, loadMembers, loadedIdentity, shareUsername]);
+
+  const revokeMember = useCallback(async (username) => {
+    const path = memberPath(loadedIdentity, username);
+    if (!path) return;
+    setShareBusy(true);
+    try {
+      await apiRequest(path, { method: "DELETE" });
+      setStatus(createStatus("success", `${username} ya no tiene acceso a este diagrama.`));
+      await loadMembers(loadedIdentity);
+    } catch (error) {
+      if (error.status !== 401) {
+        setStatus(createStatus("error", error.message));
+      }
+    } finally {
+      setShareBusy(false);
+    }
+  }, [apiRequest, loadMembers, loadedIdentity]);
 
   const refreshAdminUsers = useCallback(async () => {
     if (!authUser?.isAdmin) {
@@ -331,6 +393,7 @@ function App() {
       if (!next) return;
       documentVersion.current = next;
       persistedScene.current = scene;
+      setLoadedIdentity(next.identity);
       connectRealtime(next.identity);
       realtime.current?.publishPersistedScene(next.identity?.id, JSON.parse(scene).elements);
       setFileName(next.name);
@@ -381,6 +444,8 @@ function App() {
         if (!next) return;
         pendingReconciliation.current = null;
         documentVersion.current = next;
+        setLoadedIdentity(next.identity);
+        void loadMembers(next.identity);
         const payload = result.payload;
         const scene = payload.scene ?? {};
         const files = Object.values(scene.files ?? {});
@@ -411,7 +476,7 @@ function App() {
         setBusy(false);
       }
     },
-    [apiRequest, closeRealtime, connectRealtime, excalidrawAPI],
+    [apiRequest, closeRealtime, connectRealtime, excalidrawAPI, loadMembers],
   );
 
   const deleteDiagram = useCallback(
@@ -864,6 +929,48 @@ function App() {
                   Recargar
                 </button>
               </div>
+
+              {sharePath(loadedIdentity) ? (
+                <div className="storage-secondary-row">
+                  <input
+                    aria-label="Usuario para compartir"
+                    placeholder="usuario"
+                    value={shareUsername}
+                    onChange={(event) => setShareUsername(event.target.value)}
+                    disabled={shareBusy}
+                  />
+                  <button type="button" onClick={() => void shareMember()}
+                    disabled={shareBusy || !validUsername(shareUsername)}>
+                    Compartir
+                  </button>
+                  <button type="button" onClick={() => void loadMembers(loadedIdentity)}
+                    disabled={shareBusy}>
+                    Accesos
+                  </button>
+                </div>
+              ) : null}
+
+              {members.length > 0 ? (
+                <ul className="file-list">
+                  {members.map((member) => (
+                    <li key={member} className="file-row">
+                      <span className="file-name">{member}</span>
+                      <button
+                        type="button"
+                        className="file-delete-button"
+                        onClick={() => void revokeMember(member)}
+                        disabled={shareBusy}
+                        aria-label={`Quitar ${member}`}
+                        title={`Quitar ${member}`}
+                      >
+                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                          <path d="M9 3h6l1 2h4v2H4V5h4l1-2Zm1 6h2v8h-2V9Zm4 0h2v8h-2V9ZM7 9h2v8H7V9Zm-1 11a2 2 0 0 1-2-2V8h16v10a2 2 0 0 1-2 2H6Z" />
+                        </svg>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
 
               <div className="section-heading">
                 <h2>Mis diagramas</h2>
