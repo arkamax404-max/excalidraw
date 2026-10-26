@@ -44,3 +44,4 @@ Executor prerequisite for controlled API runs lives on branch `feat/controlled-a
 
 - Delivery strategy decided: one pull request, published as PR #1 against `main`. Merging remains a human decision.
 - Browser-level collaboration between two real clients has not been exercised end to end.
+- A browser harness is available as `npm run test:browser` (`app/scripts/test-browser.sh`, isolated image with Chromium, disposable PostgreSQL, two seeded users). It was proven to build, serve and authenticate, but the two-client scenario still fails while seeding a diagram through the API and then expecting it in the file list, so that test is not part of this delivery until it has evidence.

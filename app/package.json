@@ -9,6 +9,7 @@
     "lint": "eslint .",
     "test": "node --test",
     "test:api": "bash scripts/test-api.sh",
+    "test:browser": "bash scripts/test-browser.sh",
     "start": "node server.mjs",
     "hash-password": "node scripts/hash-password.mjs"
   },
@@ -26,6 +27,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.0",
+    "@playwright/test": "^1.51.1",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^4.7.0",
