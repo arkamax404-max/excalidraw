@@ -12,7 +12,19 @@ This record only describes what was delivered and how it was proven; `odd/tasks/
 | Account | `f1ce7f5` | Deleting an account closes only the transports of its own diagrams, before directory cleanup | RED 508 pass/2 fail; GREEN 510/510; independent verifier PASS |
 | Integration | — | Range `4597a64..f1ce7f5` reviewed as a whole | Independent verifier PASS on scope, ordering, shared machinery and existing contracts |
 
-Final API suite on the delivered content: 510 tests, 510 pass, 0 fail, exit 0.
+Final API suite on the delivered content: 510 tests, 510 pass, 0 fail, exit 0, re-run after the editor slices below.
+
+## Editor and transport slices
+
+| Slice | Commit | Behaviour | Evidence |
+| --- | --- | --- | --- |
+| Conflict reconciliation | `5804272` | Loading a server version after a save conflict applies only while the document state and generation are unchanged; otherwise the local canvas is kept and the user is told | Unit 16/16; independent verifier PASS after the generation-in-place case was added |
+| Realtime client | `123fce3` | Opens the diagram socket after load/save, publishes only persisted scenes, applies inbound scenes only without unsaved local changes, one reconnect, permanent stop on authorization failure | Unit 20/20; verifier PASS S1/S2, S3 blocked by evidence (no intermediate snapshot) |
+| Pointers and images | `d0b4dc5` | Coalesced pointer frames with a final up, remote cursors expiring after five seconds, image frames sent once and ingested additively | Unit 28/28; verifier PASS S1-S4, no findings |
+
+Presence is derived from received pointers; the relay only accepts `sync_request`, `scene`, `pointer` and `files`, so no presence frame was invented.
+
+Still unproven for these slices: browser and socket lifecycle against real peers. The API suite covers server and HTTP behaviour, not two browsers at once.
 
 Executor prerequisite for controlled API runs lives on branch `feat/controlled-api-executor`, commit `5581b7e`, with a native review approved and its authority burned. It is not part of this branch.
 
@@ -30,5 +42,5 @@ Executor prerequisite for controlled API runs lives on branch `feat/controlled-a
 
 ## Open items
 
-- Delivery strategy for this long-lived branch is undecided: one pull request, or chained review slices.
-- T5, T6 and T7 remain pending.
+- Delivery strategy decided: one pull request, published as PR #1 against `main`. Merging remains a human decision.
+- Browser-level collaboration between two real clients has not been exercised end to end.
