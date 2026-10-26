@@ -109,6 +109,24 @@ test("saved scene reaches an open peer without reload and leaves another diagram
     await a.mouse.up();
     await expect.poll(() => picture(b), { timeout: 2000, intervals: [50, 100, 200],
       message: "A's new unsaved element must appear in B's canvas within 2s" }).not.toBe(beforeDrawing);
+    // The member's own unsaved drawing must reach the owner, even while the
+    // owner holds local unsaved changes of its own (the old deadlock).
+    const drawAt = async (page, dx, dy) => {
+      const box = await page.locator(".excalidraw__canvas.interactive").boundingBox();
+      await page.mouse.move(box.x + dx, box.y + dy);
+      await page.keyboard.press("r");
+      await page.mouse.down();
+      await page.mouse.move(box.x + dx + 40, box.y + dy + 40, { steps: 5 });
+      await page.mouse.up();
+    };
+    await drawAt(a, 300, 310);
+    const aAfterOwn = await picture(a);
+    const bBeforeOwn = await picture(b);
+    await drawAt(b, 320, 320);
+    await expect.poll(() => picture(b), { timeout: 2000, intervals: [50, 100, 200],
+      message: "B must render A's element even though B also has unsaved work" }).not.toBe(bBeforeOwn);
+    await expect.poll(() => picture(a), { timeout: 2000, intervals: [50, 100, 200],
+      message: "A must render B's element while A itself has unsaved changes" }).not.toBe(aAfterOwn);
     const unchanged = await picture(control);
     let navigations = 0;
     b.on("framenavigated", frame => { if (frame === b.mainFrame()) navigations++; });
@@ -117,9 +135,10 @@ test("saved scene reaches an open peer without reload and leaves another diagram
     await a.keyboard.press("Backspace");
     await a.mouse.move(10, 10);
     const saved = await save(a);
-    expect(saved.request().postDataJSON().elements).toEqual([
-      expect.objectContaining({ id: "shared-shape", isDeleted: true }),
-    ]);
+    const savedElements = saved.request().postDataJSON().elements;
+    expect(savedElements.filter((element) => !element.isDeleted), "everything drawn is deleted").toEqual([]);
+    expect(savedElements.find((element) => element.id === "shared-shape"),
+      "the shared shape is deleted").toMatchObject({ isDeleted: true });
     // Two seconds is a realtime deadline, not a manual refresh/polling cycle.
     await expect.poll(() => picture(b), { timeout: 2000, intervals: [50, 100, 200],
       message: "A's saved deletion must become visible in B's already-open canvas within 2s without reload" }).toBe(blank);

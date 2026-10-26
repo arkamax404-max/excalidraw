@@ -11,7 +11,7 @@ import { toMermaidDownloadFilename } from "./mermaid/mermaidFilename.js";
 import { convertAndInsertMermaid } from "./ai/mermaidToScene.js";
 
 import { serializeScene } from "./scene-serialization.mjs";
-import { mayApplyScene, openRealtime } from "./realtime-client.mjs";
+import { mayApplyScene, mergeElements, openRealtime } from "./realtime-client.mjs";
 import { documentContext, renameDocument, beginDocumentOperation, documentHeaders,
   acknowledgeDocument, readApiResponse, documentError, normalizeDocumentName,
   beginReconciliation, canApplyServerDocument, documentTarget,
@@ -106,9 +106,12 @@ function App() {
       },
       onCollaborators: (collaborators) => excalidrawAPI.updateScene({ collaborators }),
       onScene: (frame) => {
-        if (!mayApplyScene(frame, snapshot() !== persistedScene.current)) return;
+        if (!mayApplyScene(frame)) return;
+        const local = excalidrawAPI.getSceneElementsIncludingDeleted();
+        const merged = mergeElements(local, frame.payload.elements);
+        if (merged === local) return;
         remoteAppliedAt.current = Date.now();
-        excalidrawAPI.updateScene({ elements: frame.payload.elements });
+        excalidrawAPI.updateScene({ elements: merged });
         persistedScene.current = snapshot();
       },
       onAuthorizationFailure: () => {

@@ -159,19 +159,18 @@ test("transport retains one reconnect and permanently stops after authorization 
 
 const scene = { type: "scene", payload: { elements: [] } };
 
-test("scene applies only when there are no unsaved local changes", async () => {
-  const { mayApplyScene: decide } = await import("./realtime-client.mjs");
-  assert.equal(decide(scene, false), true);
-  assert.equal(decide(scene, true), false);
+test("scene gates on frame shape only: local edits are merged, never refused", () => {
+  // A dirty document used to refuse every peer frame, which deadlocked both sides.
+  assert.equal(mayApplyScene(scene), true);
 });
 
 test("non-scene and malformed frames never apply", () => {
   for (const frame of [null, {}, { type: "pointer", payload: {} },
     { type: "scene" }, { type: "scene", payload: { elements: {} } },
     { type: "scene", payload: { elements: [] }, unexpected: {} }]) {
-    assert.equal(mayApplyScene(frame, false), false);
+    assert.equal(mayApplyScene(frame), false);
   }
-  assert.equal(mayApplyScene({ ...scene, sender: { userId: "2" } }, false), true);
+  assert.equal(mayApplyScene({ ...scene, sender: { userId: "2" } }), true);
 });
 
 test("authorization failures stop permanently even before the retry", () => {
@@ -182,21 +181,21 @@ test("authorization failures stop permanently even before the retry", () => {
   }
 });
 
-test("other closes allow exactly one reconnect without resetting on success", () => {
+test("transport closes retry a bounded number of times; open resets the counter", () => {
   for (const code of [1000, 1006, 1011, 1013]) {
     assert.equal(closeDecision(code, 0), "reconnect");
-    assert.equal(closeDecision(code, 1), "stop");
-    assert.equal(closeDecision(code, 2), "stop");
+    assert.equal(closeDecision(code, 2), "reconnect");
+    assert.equal(closeDecision(code, 3), "stop");
   }
 });
 
 test("scene delay mirrors the coalescing window boundary", () => {
   assert.equal(client.sceneDelay(null, 0), 0);
-  assert.equal(client.sceneDelay(0, 100), 150);
-  assert.equal(client.sceneDelay(0, 250), 0);
+  assert.equal(client.sceneDelay(0, 100), 700);
+  assert.equal(client.sceneDelay(0, 800), 0);
 });
 
-test("live scene frames coalesce within 250ms and never send while disconnected", () => {
+test("live scene frames coalesce within 800ms and never send while disconnected", () => {
   const h = harness();
   h.connection.publishScene([{ id: "a" }]);
   h.advance(1000);
@@ -207,7 +206,7 @@ test("live scene frames coalesce within 250ms and never send while disconnected"
   assert.equal(first.length, 1);
   assert.deepEqual(Object.keys(first[0]), ["type", "payload"]);
   h.connection.publishScene([{ id: "b" }]);
-  h.advance(249);
+  h.advance(799);
   assert.equal(h.sent.filter((frame) => frame.type === "scene").length, 1);
   h.advance(1);
   const frames = h.sent.filter((frame) => frame.type === "scene");
@@ -217,4 +216,42 @@ test("live scene frames coalesce within 250ms and never send while disconnected"
   h.connection.publishScene([{ id: "c" }]);
   h.advance(1000);
   assert.equal(h.sent.filter((frame) => frame.type === "scene").length, 2);
+});
+
+test("closeDecision retries a transport close but never an authorization close", () => {
+  assert.equal(client.closeDecision(1008, 0), "authorization_failed");
+  assert.equal(client.closeDecision(401, 0), "authorization_failed");
+  assert.equal(client.closeDecision(1013, 0), "reconnect");
+  assert.equal(client.closeDecision(1013, 2), "reconnect");
+  assert.equal(client.closeDecision(1013, 3), "stop");
+  assert.equal(client.closeDecision(1006, 3), "stop");
+});
+
+test("unchanged scenes are not resent, and a reconnect resynchronises the peer", () => {
+  const h = harness();
+  const socket = h.open();
+  h.connection.publishScene([{ id: "a" }]);
+  assert.equal(h.sent.filter((frame) => frame.type === "scene").length, 1);
+  h.advance(2000);
+  h.connection.publishScene([{ id: "a" }]);
+  h.advance(2000);
+  assert.equal(h.sent.filter((frame) => frame.type === "scene").length, 1);
+  socket.onclose({ code: 1013 });
+  h.advance(600);
+  h.open();
+  const scenes = h.sent.filter((frame) => frame.type === "scene");
+  assert.equal(scenes.length, 2);
+  assert.deepEqual(scenes[1].payload, { elements: [{ id: "a" }] });
+});
+
+test("concurrent edits converge per element instead of blocking the peer", () => {
+  const local = [{ id: "a", version: 3, updated: 10, isDeleted: false }];
+  const added = client.mergeElements(local, [{ id: "b", version: 1, updated: 20, isDeleted: false }]);
+  assert.deepEqual(added.map((element) => element.id), ["a", "b"]);
+  const replaced = client.mergeElements(local, [{ id: "a", version: 4, updated: 30, isDeleted: true }]);
+  assert.equal(replaced[0].isDeleted, true);
+  assert.equal(replaced[0].version, 4);
+  const keptLocal = client.mergeElements(local, [{ id: "a", version: 2, updated: 99, isDeleted: true }]);
+  assert.strictEqual(keptLocal, local);
+  assert.strictEqual(client.mergeElements(local, []), local);
 });

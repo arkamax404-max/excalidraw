@@ -1,5 +1,5 @@
-export const mayApplyScene = (frame, hasUnsavedChanges) => {
-  if (hasUnsavedChanges || !frame || typeof frame !== "object" || Array.isArray(frame)) return false;
+export const mayApplyScene = (frame) => {
+  if (!frame || typeof frame !== "object" || Array.isArray(frame)) return false;
   // The relay forwards frames with `sender` added, so that key is the only allowed extra.
   const keys = Object.keys(frame);
   if (frame.type !== "scene" || !keys.includes("payload")) return false;
@@ -11,7 +11,31 @@ export const mayApplyScene = (frame, hasUnsavedChanges) => {
 
 export const closeDecision = (code, reconnects) =>
   [1008, 401, 403, 404].includes(code) ? "authorization_failed" :
-    reconnects < 1 ? "reconnect" : "stop";
+    reconnects < 3 ? "reconnect" : "stop";
+
+// Two people edit at once without a server-side merge: converge per element by
+// Excalidraw's own version counters, so a local edit never blocks the peer's.
+export const mergeElements = (local, remote) => {
+  const position = new Map(local.map((element, index) => [element.id, index]));
+  const next = local.slice();
+  let changed = false;
+  for (const element of remote) {
+    const at = position.get(element.id);
+    if (at === undefined) {
+      position.set(element.id, next.push(element) - 1);
+      changed = true;
+      continue;
+    }
+    const current = next[at];
+    const newer = element.version > current.version
+      || (element.version === current.version && Number(element.updated) > Number(current.updated));
+    if (newer) {
+      next[at] = element;
+      changed = true;
+    }
+  }
+  return changed ? next : local;
+};
 
 const record = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 const exact = (value, keys) => record(value) && Object.keys(value).length === keys.length &&
@@ -39,7 +63,7 @@ export const mayApplyPointer = (frame) => envelope(frame, "pointer") && validPoi
 export const mayApplyFiles = (frame) => envelope(frame, "files") && exact(frame.payload, ["files"]) &&
   record(frame.payload.files) && Object.entries(frame.payload.files).every(([id, file]) => validFile(id, file));
 export const pointerDelay = (lastSentAt, now) => lastSentAt === null ? 0 : Math.max(0, 50 - (now - lastSentAt));
-export const sceneDelay = (lastSentAt, now) => lastSentAt === null ? 0 : Math.max(0, 250 - (now - lastSentAt));
+export const sceneDelay = (lastSentAt, now) => lastSentAt === null ? 0 : Math.max(0, 800 - (now - lastSentAt));
 export const freshPointers = (entries, now) => new Map([...entries].filter(([, value]) => now - value.seenAt < 5000));
 export const filesToSend = (files, knownIds) => Object.fromEntries(Object.entries(files)
   .filter(([id, file]) => !knownIds.has(id) && validFile(id, file)));
@@ -61,6 +85,7 @@ export function openRealtime({ diagramId, ownerWindow, onScene, onAuthorizationF
   let pointers = new Map();
   let sceneTimer;
   let lastSceneAt = null;
+  let lastSceneSent = null;
   const knownFiles = new Set();
   const now = () => ownerWindow.performance.now();
   const send = (type, payload) => {
@@ -101,8 +126,13 @@ export function openRealtime({ diagramId, ownerWindow, onScene, onAuthorizationF
   };
   const flush = () => {
     if (!stopped && socket?.readyState === 1 && pendingScene) {
-      socket.send(JSON.stringify({ type: "scene", payload: { elements: pendingScene } }));
+      // Selection, scroll and app-state changes also reach onChange: never resend
+      // an identical scene, and keep the last one for resynchronising a reconnect.
+      const signature = JSON.stringify(pendingScene);
       pendingScene = null;
+      if (signature === lastSceneSent) return;
+      lastSceneSent = signature;
+      socket.send(JSON.stringify({ type: "scene", payload: { elements: JSON.parse(signature) } }));
     }
   };
   const connect = () => {
@@ -110,8 +140,14 @@ export function openRealtime({ diagramId, ownerWindow, onScene, onAuthorizationF
     socket = new ownerWindow.WebSocket(url.href);
     socket.onopen = () => {
       if (stopped) return;
+      reconnects = 0;
       publishFiles();
+      const beforeOpen = lastSceneSent;
       flush();
+      // A reconnect starts from an empty protocol state, so replay the last scene.
+      if (lastSceneSent && lastSceneSent === beforeOpen) {
+        socket.send(JSON.stringify({ type: "scene", payload: { elements: JSON.parse(lastSceneSent) } }));
+      }
     };
     socket.onmessage = (event) => {
       if (stopped) return;
