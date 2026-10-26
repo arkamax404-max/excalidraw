@@ -11,6 +11,7 @@ import { toMermaidDownloadFilename } from "./mermaid/mermaidFilename.js";
 import { convertAndInsertMermaid } from "./ai/mermaidToScene.js";
 
 import { serializeScene } from "./scene-serialization.mjs";
+import { mayApplyScene, openRealtime } from "./realtime-client.mjs";
 import { documentContext, renameDocument, beginDocumentOperation, documentHeaders,
   acknowledgeDocument, readApiResponse, documentError, normalizeDocumentName,
   beginReconciliation, canApplyServerDocument } from "./document-version.mjs";
@@ -70,6 +71,36 @@ function App() {
   const documentVersion = useRef(documentContext(null, DEFAULT_FILE_NAME));
   const saveConflict = useRef(null);
   const pendingReconciliation = useRef(null);
+  const editorNode = useRef(null);
+  const realtime = useRef(null);
+  const persistedScene = useRef(null);
+  const closeRealtime = useCallback(() => {
+    realtime.current?.close();
+    realtime.current = null;
+  }, []);
+  useEffect(() => closeRealtime, [closeRealtime]);
+  const connectRealtime = useCallback((identity) => {
+    if (realtime.current?.diagramId === identity?.id) return;
+    closeRealtime();
+    const ownerWindow = editorNode.current?.ownerDocument.defaultView;
+    if (!identity || !ownerWindow || !excalidrawAPI) return;
+    const snapshot = () => serializeScene(excalidrawAPI.getSceneElementsIncludingDeleted(),
+      excalidrawAPI.getAppState(), excalidrawAPI.getFiles(), serializeAsJSON);
+    realtime.current = openRealtime({
+      diagramId: identity.id,
+      ownerWindow,
+      onScene: (frame) => {
+        if (!mayApplyScene(frame, snapshot() !== persistedScene.current)) return;
+        excalidrawAPI.updateScene({ elements: frame.payload.elements });
+        persistedScene.current = snapshot();
+      },
+      onAuthorizationFailure: () => {
+        const message = "Conexion detenida: ya no tienes acceso al diagrama.";
+        setStatus(createStatus("error", message));
+        excalidrawAPI.setToast({ message, closable: true });
+      },
+    });
+  }, [closeRealtime, excalidrawAPI]);
   const trackReconciliationChanges = useCallback((elements, appState, files) => {
     const pending = pendingReconciliation.current;
     if (pending && canApplyServerDocument(documentVersion.current, pending.token)
@@ -79,6 +110,7 @@ function App() {
     }
   }, []);
   const resetDocumentIdentity = (account, name = DEFAULT_FILE_NAME) => {
+    closeRealtime();
     documentVersion.current = documentContext(account, name, documentVersion.current);
   };
 
@@ -220,6 +252,7 @@ function App() {
   );
 
   const logout = useCallback(async () => {
+    closeRealtime();
     resetDocumentIdentity(documentVersion.current.account);
     setBusy(true);
 
@@ -239,7 +272,7 @@ function App() {
     } finally {
       setBusy(false);
     }
-  }, [apiRequest]);
+  }, [apiRequest, closeRealtime]);
 
   const saveDiagram = useCallback(async () => {
     if (!excalidrawAPI) {
@@ -266,6 +299,9 @@ function App() {
       const next = acknowledgeDocument(documentVersion.current, operation, result);
       if (!next) return;
       documentVersion.current = next;
+      persistedScene.current = scene;
+      connectRealtime(next.identity);
+      realtime.current?.publishPersistedScene(next.identity?.id, JSON.parse(scene).elements);
       setFileName(next.name);
       setStatus(createStatus(result.warning ? "info" : "success",
         `Guardado como ${result.payload.file.fileName}.${result.warning ? " PostgreSQL confirmado; fallo el respaldo." : ""}${!next.identity ? " Falta la version: carga el diagrama antes de reemplazarlo." : ""}`));
@@ -278,7 +314,7 @@ function App() {
     } finally {
       setBusy(false);
     }
-  }, [apiRequest, currentFileName, excalidrawAPI, refreshFiles]);
+  }, [apiRequest, connectRealtime, currentFileName, excalidrawAPI, refreshFiles]);
 
   const loadDiagram = useCallback(
     async (name) => {
@@ -288,6 +324,7 @@ function App() {
 
       setBusy(true);
       setStatus(createStatus("info", `Cargando ${name}...`));
+      closeRealtime();
       const previous = documentVersion.current;
       const operation = beginDocumentOperation(renameDocument(previous, name));
       documentVersion.current = operation;
@@ -324,6 +361,9 @@ function App() {
           appState: scene.appState ?? {},
         });
         excalidrawAPI.history.clear();
+        persistedScene.current = serializeScene(excalidrawAPI.getSceneElementsIncludingDeleted(),
+          excalidrawAPI.getAppState(), excalidrawAPI.getFiles(), serializeAsJSON);
+        connectRealtime(next.identity);
         setFileName(payload.file.name);
         setStatus(
           createStatus("success", `${payload.file.fileName} cargado.`),
@@ -338,7 +378,7 @@ function App() {
         setBusy(false);
       }
     },
-    [apiRequest, excalidrawAPI],
+    [apiRequest, closeRealtime, connectRealtime, excalidrawAPI],
   );
 
   const deleteDiagram = useCallback(
@@ -687,7 +727,7 @@ function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div className="app-shell" ref={editorNode}>
       <main className="editor-shell">
         <Excalidraw
           excalidrawAPI={setExcalidrawAPI}
