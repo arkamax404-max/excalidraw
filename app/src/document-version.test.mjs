@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { normalizeDocumentName, documentContext, renameDocument, beginDocumentOperation,
   documentHeaders, acknowledgeDocument, readApiResponse, documentError,
-  beginReconciliation, canApplyServerDocument } from "./document-version.mjs";
+  beginReconciliation, canApplyServerDocument, documentTarget } from "./document-version.mjs";
 
 const reply = (etag = '"9007199254740993:2"', warning) => ({
   payload: { file: { name: "one", fileName: "one.excalidraw" }, warning },
@@ -23,7 +23,7 @@ test("normalization matches server boundaries, not a new naming policy", () => {
 
 test("only exact strong BIGINT identity is admitted and sent to its known name", () => {
   const state = loaded();
-  assert.deepEqual(state.identity, { id: "9007199254740993", revision: "2", etag: '"9007199254740993:2"', name: "one" });
+  assert.deepEqual(state.identity, { kind: "file", id: "9007199254740993", revision: "2", etag: '"9007199254740993:2"', name: "one" });
   assert.deepEqual(documentHeaders(renameDocument(state, "ＯＮＥ")), { "If-Match": '"9007199254740993:2"' });
   assert.deepEqual(documentHeaders(renameDocument(state, "existing-unknown")), {});
   assert.deepEqual(documentHeaders(documentContext("bob", "one")), {});
@@ -60,8 +60,25 @@ test("name, new/load generations and blank/logout/account/delete reject late ack
   assert.deepEqual(documentHeaders(savedAs), { "If-Match": '"42:1"' });
 });
 
-test("reconciliation token authorises its unchanged document state", () => {
-  const state = loaded();
+test("shared diagrams are reached by id and acknowledged from a diagram payload", () => {
+  assert.deepEqual(documentTarget({ name: "one" }), { kind: "file", path: "/api/files/one" });
+  assert.deepEqual(documentTarget({ name: "a b", kind: "file" }), { kind: "file", path: "/api/files/a%20b" });
+  assert.deepEqual(documentTarget({ name: "one", kind: "diagram", id: "7" }), { kind: "diagram", path: "/api/diagrams/7" });
+  assert.deepEqual(documentTarget({ name: "one", kind: "diagram" }), { kind: "file", path: "/api/files/one" });
+  const operation = beginDocumentOperation(documentContext("bob", "one"));
+  const shared = acknowledgeDocument(operation, operation, {
+    payload: { diagram: { name: "one", fileName: "one.excalidraw.json" } },
+    etag: '"7:4"', status: 200,
+  });
+  assert.deepEqual(shared.identity, { kind: "diagram", id: "7", revision: "4", etag: '"7:4"', name: "one" });
+  assert.deepEqual(documentTarget(shared.identity).path, "/api/diagrams/7");
+  assert.deepEqual(documentHeaders(shared), { "If-Match": '"7:4"' });
+  assert.equal(acknowledgeDocument(operation, operation, {
+    payload: { diagram: { name: "otro" } }, etag: '"7:4"', status: 200,
+  }), null);
+});
+
+test("reconciliation token authorises its unchanged document state", () => {  const state = loaded();
   const token = beginReconciliation(state);
   assert.equal(canApplyServerDocument(state, token), true);
 });

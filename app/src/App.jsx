@@ -14,7 +14,8 @@ import { serializeScene } from "./scene-serialization.mjs";
 import { mayApplyScene, openRealtime } from "./realtime-client.mjs";
 import { documentContext, renameDocument, beginDocumentOperation, documentHeaders,
   acknowledgeDocument, readApiResponse, documentError, normalizeDocumentName,
-  beginReconciliation, canApplyServerDocument } from "./document-version.mjs";
+  beginReconciliation, canApplyServerDocument, documentTarget,
+  documentPayloadName } from "./document-version.mjs";
 
 const DEFAULT_FILE_NAME = "diagrama-1";
 const ADMIN_FORM_INITIAL_STATE = {
@@ -168,8 +169,18 @@ function App() {
     }
 
     try {
-      const payload = await apiRequest("/api/files");
-      setAvailableFiles(payload?.files ?? []);
+      const [own, accessible] = await Promise.all([
+        apiRequest("/api/files"),
+        apiRequest("/api/diagrams"),
+      ]);
+      const ownFiles = own?.files ?? [];
+      const ownedNames = new Set(ownFiles.map((file) => file.name));
+      // A diagram only in the accessible listing is shared with this user and is
+      // opened by id; names are per owner, so they never address the same file.
+      const shared = (accessible?.diagrams ?? [])
+        .filter((diagram) => !ownedNames.has(diagram.name))
+        .map((diagram) => ({ ...diagram, kind: "diagram", shared: true }));
+      setAvailableFiles([...ownFiles.map((file) => ({ ...file, kind: "file" })), ...shared]);
     } catch (error) {
       if (error.status !== 401) {
         setStatus(createStatus("error", error.message));
@@ -301,8 +312,19 @@ function App() {
         serializeAsJSON,
       );
 
-      const result = await apiRequest(
-        `/api/files/${encodeURIComponent(currentFileName)}`,
+      const target = documentTarget({
+        kind: documentVersion.current.identity?.kind,
+        id: documentVersion.current.identity?.id,
+        name: currentFileName,
+      });
+      // Renaming belongs to the owner: the id endpoint accepts member writes but
+      // keeps the stored name, so refuse instead of sending a save without If-Match.
+      if (operation.identity?.kind === "diagram"
+        && normalizeDocumentName(currentFileName) !== operation.identity.name) {
+        setStatus(createStatus("error", "Solo el propietario puede cambiar el nombre de un diagrama compartido."));
+        return;
+      }
+      const result = await apiRequest(target.path,
         { method: "PUT", body: scene, headers: documentHeaders(operation) }, true, operation,
       );
       const next = acknowledgeDocument(documentVersion.current, operation, result);
@@ -313,7 +335,7 @@ function App() {
       realtime.current?.publishPersistedScene(next.identity?.id, JSON.parse(scene).elements);
       setFileName(next.name);
       setStatus(createStatus(result.warning ? "info" : "success",
-        `Guardado como ${result.payload.file.fileName}.${result.warning ? " PostgreSQL confirmado; fallo el respaldo." : ""}${!next.identity ? " Falta la version: carga el diagrama antes de reemplazarlo." : ""}`));
+        `Guardado como ${documentPayloadName(result.payload)}.${result.warning ? " PostgreSQL confirmado; fallo el respaldo." : ""}${!next.identity ? " Falta la version: carga el diagrama antes de reemplazarlo." : ""}`));
       await refreshFiles();
     } catch (error) {
       if (documentVersion.current === operation) {
@@ -326,11 +348,13 @@ function App() {
   }, [apiRequest, connectRealtime, currentFileName, excalidrawAPI, refreshFiles]);
 
   const loadDiagram = useCallback(
-    async (name) => {
+    async (entry) => {
       if (!excalidrawAPI) {
         return;
       }
 
+      const name = entry.name;
+      const target = documentTarget(entry);
       setBusy(true);
       setStatus(createStatus("info", `Cargando ${name}...`));
       closeRealtime();
@@ -348,7 +372,7 @@ function App() {
       if (reconciliation) saveConflict.current = operation;
 
       try {
-        const result = await apiRequest(`/api/files/${encodeURIComponent(name)}`, {}, true, operation);
+        const result = await apiRequest(target.path, {}, true, operation);
         if (reconciliation && !canApplyServerDocument(documentVersion.current, reconciliation.token)) {
           setStatus(createStatus("info", "El lienzo conserva los cambios locales porque cambio mientras se cargaba la version del servidor."));
           return;
@@ -373,9 +397,9 @@ function App() {
         persistedScene.current = serializeScene(excalidrawAPI.getSceneElementsIncludingDeleted(),
           excalidrawAPI.getAppState(), excalidrawAPI.getFiles(), serializeAsJSON);
         connectRealtime(next.identity);
-        setFileName(payload.file.name);
+        setFileName(payload.file?.name ?? payload.diagram?.name);
         setStatus(
-          createStatus("success", `${payload.file.fileName} cargado.`),
+          createStatus("success", `${documentPayloadName(payload)} cargado.`),
         );
       } catch (error) {
         if (documentVersion.current === operation) {
@@ -851,17 +875,21 @@ function App() {
               ) : (
                 <ul className="file-list">
                   {availableFiles.map((item) => (
-                    <li key={item.fileName} className="file-row">
+                    <li key={item.kind === "diagram" ? `d:${item.id}` : `f:${item.name}`} className="file-row">
                       <button
                         type="button"
                         className="file-button"
-                        onClick={() => void loadDiagram(item.name)}
+                        onClick={() => void loadDiagram(item)}
                         disabled={busy}
                       >
                         <span className="file-name">{item.fileName}</span>
-                        <small>{new Date(item.updatedAt).toLocaleString("es-ES")}</small>
+                        <small>
+                          {item.shared ? "Compartido · " : ""}
+                          {new Date(item.updatedAt).toLocaleString("es-ES")}
+                        </small>
                       </button>
-                      <button
+                      {item.shared ? null : (
+                        <button
                         type="button"
                         className="file-delete-button"
                         onClick={() => void deleteDiagram(item.name)}
@@ -873,6 +901,7 @@ function App() {
                           <path d="M9 3h6l1 2h4v2H4V5h4l1-2Zm1 6h2v8h-2V9Zm4 0h2v8h-2V9ZM7 9h2v8H7V9Zm-1 11a2 2 0 0 1-2-2V8h16v10a2 2 0 0 1-2 2H6Z" />
                         </svg>
                       </button>
+                      )}
                     </li>
                   ))}
                 </ul>

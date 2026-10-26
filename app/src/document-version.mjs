@@ -13,13 +13,22 @@ export const canApplyServerDocument = (current, token) =>
 export const documentHeaders = (state) => state.account && state.identity?.name === normalizeDocumentName(state.name)
   ? { "If-Match": state.identity.etag } : {};
 
+export const documentTarget = (entry = {}) => entry.kind === "diagram" && entry.id
+  ? { kind: "diagram", path: `/api/diagrams/${entry.id}` }
+  : { kind: "file", path: `/api/files/${encodeURIComponent(entry.name ?? "")}` };
+
+const acknowledgedName = (payload) => payload?.file?.name ?? payload?.diagram?.name;
+const acknowledgedFileName = (payload) => payload?.file?.fileName ?? payload?.diagram?.fileName;
+export const documentPayloadName = acknowledgedFileName;
+
 export function acknowledgeDocument(current, operation, result) {
   if (current !== operation || result.status !== 200) return null;
-  const name = result.payload?.file?.name;
+  const name = acknowledgedName(result.payload);
   if (typeof name !== "string" || name !== normalizeDocumentName(operation.name)) return null;
   const parts = /^"([1-9][0-9]{0,18}):([1-9][0-9]{0,18})"$/.exec(result.etag);
   const valid = parts && parts.slice(1).every(value => BigInt(value) <= 9223372036854775807n);
-  return { ...current, name, identity: valid ? { name, id: parts[1], revision: parts[2], etag: result.etag } : null };
+  const kind = result.payload?.diagram ? "diagram" : "file";
+  return { ...current, name, identity: valid ? { kind, name, id: parts[1], revision: parts[2], etag: result.etag } : null };
 }
 
 export function documentError(error) {
