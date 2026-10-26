@@ -189,3 +189,32 @@ test("other closes allow exactly one reconnect without resetting on success", ()
     assert.equal(closeDecision(code, 2), "stop");
   }
 });
+
+test("scene delay mirrors the coalescing window boundary", () => {
+  assert.equal(client.sceneDelay(null, 0), 0);
+  assert.equal(client.sceneDelay(0, 100), 150);
+  assert.equal(client.sceneDelay(0, 250), 0);
+});
+
+test("live scene frames coalesce within 250ms and never send while disconnected", () => {
+  const h = harness();
+  h.connection.publishScene([{ id: "a" }]);
+  h.advance(1000);
+  assert.equal(h.sent.filter((frame) => frame.type === "scene").length, 0);
+  h.open();
+  h.connection.publishScene([{ id: "a" }]);
+  const first = h.sent.filter((frame) => frame.type === "scene");
+  assert.equal(first.length, 1);
+  assert.deepEqual(Object.keys(first[0]), ["type", "payload"]);
+  h.connection.publishScene([{ id: "b" }]);
+  h.advance(249);
+  assert.equal(h.sent.filter((frame) => frame.type === "scene").length, 1);
+  h.advance(1);
+  const frames = h.sent.filter((frame) => frame.type === "scene");
+  assert.equal(frames.length, 2);
+  assert.deepEqual(frames[1].payload, { elements: [{ id: "b" }] });
+  h.connection.close();
+  h.connection.publishScene([{ id: "c" }]);
+  h.advance(1000);
+  assert.equal(h.sent.filter((frame) => frame.type === "scene").length, 2);
+});

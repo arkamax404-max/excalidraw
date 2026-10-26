@@ -39,6 +39,7 @@ export const mayApplyPointer = (frame) => envelope(frame, "pointer") && validPoi
 export const mayApplyFiles = (frame) => envelope(frame, "files") && exact(frame.payload, ["files"]) &&
   record(frame.payload.files) && Object.entries(frame.payload.files).every(([id, file]) => validFile(id, file));
 export const pointerDelay = (lastSentAt, now) => lastSentAt === null ? 0 : Math.max(0, 50 - (now - lastSentAt));
+export const sceneDelay = (lastSentAt, now) => lastSentAt === null ? 0 : Math.max(0, 250 - (now - lastSentAt));
 export const freshPointers = (entries, now) => new Map([...entries].filter(([, value]) => now - value.seenAt < 5000));
 export const filesToSend = (files, knownIds) => Object.fromEntries(Object.entries(files)
   .filter(([id, file]) => !knownIds.has(id) && validFile(id, file)));
@@ -58,6 +59,8 @@ export function openRealtime({ diagramId, ownerWindow, onScene, onAuthorizationF
   let expiryTimer;
   let lastSentAt = null;
   let pointers = new Map();
+  let sceneTimer;
+  let lastSceneAt = null;
   const knownFiles = new Set();
   const now = () => ownerWindow.performance.now();
   const send = (type, payload) => {
@@ -87,6 +90,8 @@ export function openRealtime({ diagramId, ownerWindow, onScene, onAuthorizationF
     }
   };
   const clearEphemeral = () => {
+    ownerWindow.clearTimeout(sceneTimer);
+    sceneTimer = undefined;
     ownerWindow.clearTimeout(pointerTimer);
     ownerWindow.clearTimeout(expiryTimer);
     pointerTimer = undefined;
@@ -148,6 +153,15 @@ export function openRealtime({ diagramId, ownerWindow, onScene, onAuthorizationF
       const delay = pointerDelay(lastSentAt, now());
       if (delay === 0) flushPointer();
       else pointerTimer = ownerWindow.setTimeout(flushPointer, delay);
+    },
+    publishScene(elements) {
+      if (stopped || socket?.readyState !== 1 || !Array.isArray(elements)) return;
+      pendingScene = elements;
+      if (sceneTimer !== undefined) return;
+      const delay = sceneDelay(lastSceneAt, now());
+      lastSceneAt = now();
+      if (delay === 0) flush();
+      else sceneTimer = ownerWindow.setTimeout(() => { sceneTimer = undefined; flush(); }, delay);
     },
     publishPersistedScene(id, elements) {
       if (stopped || id !== diagramId) return;

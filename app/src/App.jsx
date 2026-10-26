@@ -80,6 +80,8 @@ function App() {
   const editorNode = useRef(null);
   const realtime = useRef(null);
   const persistedScene = useRef(null);
+  // Applying a remote scene fires onChange; it must not be echoed back.
+  const remoteAppliedAt = useRef(0);
   const localPointer = useRef(null);
   const closeRealtime = useCallback(() => {
     realtime.current?.close();
@@ -105,6 +107,7 @@ function App() {
       onCollaborators: (collaborators) => excalidrawAPI.updateScene({ collaborators }),
       onScene: (frame) => {
         if (!mayApplyScene(frame, snapshot() !== persistedScene.current)) return;
+        remoteAppliedAt.current = Date.now();
         excalidrawAPI.updateScene({ elements: frame.payload.elements });
         persistedScene.current = snapshot();
       },
@@ -117,6 +120,7 @@ function App() {
   }, [closeRealtime, excalidrawAPI]);
   const trackReconciliationChanges = useCallback((elements, appState, files) => {
     realtime.current?.publishFiles();
+    if (Date.now() - remoteAppliedAt.current > 250) realtime.current?.publishScene(elements);
     const pending = pendingReconciliation.current;
     if (pending && canApplyServerDocument(documentVersion.current, pending.token)
       && serializeScene(elements, appState, files, serializeAsJSON) !== pending.scene) {

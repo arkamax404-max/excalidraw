@@ -99,6 +99,16 @@ test("saved scene reaches an open peer without reload and leaves another diagram
       message: "Peer initially renders the shared shape" }).not.toBe(blank);
     await expect.poll(() => picture(control), { timeout: 2000,
       message: "Control initially renders its independent shape" }).not.toBe(blank);
+    // An element drawn but never saved must still reach the peer.
+    const beforeDrawing = await picture(b);
+    const canvasBox = await a.locator(".excalidraw__canvas.interactive").boundingBox();
+    await a.mouse.move(canvasBox.x + 300, canvasBox.y + 300);
+    await a.keyboard.press("r");
+    await a.mouse.down();
+    await a.mouse.move(canvasBox.x + 350, canvasBox.y + 350, { steps: 5 });
+    await a.mouse.up();
+    await expect.poll(() => picture(b), { timeout: 2000, intervals: [50, 100, 200],
+      message: "A's new unsaved element must appear in B's canvas within 2s" }).not.toBe(beforeDrawing);
     const unchanged = await picture(control);
     let navigations = 0;
     b.on("framenavigated", frame => { if (frame === b.mainFrame()) navigations++; });
