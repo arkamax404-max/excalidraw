@@ -74,6 +74,7 @@ function App() {
   const editorNode = useRef(null);
   const realtime = useRef(null);
   const persistedScene = useRef(null);
+  const localPointer = useRef(null);
   const closeRealtime = useCallback(() => {
     realtime.current?.close();
     realtime.current = null;
@@ -89,6 +90,13 @@ function App() {
     realtime.current = openRealtime({
       diagramId: identity.id,
       ownerWindow,
+      getFiles: () => excalidrawAPI.getFiles(),
+      onFiles: (files) => {
+        const wasClean = snapshot() === persistedScene.current;
+        if (files.length) excalidrawAPI.addFiles(files);
+        if (wasClean) persistedScene.current = snapshot();
+      },
+      onCollaborators: (collaborators) => excalidrawAPI.updateScene({ collaborators }),
       onScene: (frame) => {
         if (!mayApplyScene(frame, snapshot() !== persistedScene.current)) return;
         excalidrawAPI.updateScene({ elements: frame.payload.elements });
@@ -102,6 +110,7 @@ function App() {
     });
   }, [closeRealtime, excalidrawAPI]);
   const trackReconciliationChanges = useCallback((elements, appState, files) => {
+    realtime.current?.publishFiles();
     const pending = pendingReconciliation.current;
     if (pending && canApplyServerDocument(documentVersion.current, pending.token)
       && serializeScene(elements, appState, files, serializeAsJSON) !== pending.scene) {
@@ -728,10 +737,17 @@ function App() {
 
   return (
     <div className="app-shell" ref={editorNode}>
-      <main className="editor-shell">
+      <main className="editor-shell" onPointerLeave={() => {
+        if (localPointer.current) realtime.current?.publishPointer({ button: "up", pointer: localPointer.current });
+      }}>
         <Excalidraw
           excalidrawAPI={setExcalidrawAPI}
           onChange={trackReconciliationChanges}
+          onPointerUpdate={({ pointer, button }) => {
+            const tool = excalidrawAPI?.getAppState().activeTool.type === "laser" ? "laser" : "pointer";
+            localPointer.current = { x: pointer.x, y: pointer.y, tool };
+            realtime.current?.publishPointer({ pointer: localPointer.current, button });
+          }}
           name={currentFileName}
           renderTopRightUI={renderTopRightUI}
           UIOptions={{
