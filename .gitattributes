@@ -1,0 +1,6 @@
+# These files are parsed as raw bytes: a trailing CR breaks shell shebangs and
+# option names (`set -o pipefail`), and Dockerfile line continuations.
+*.sh           text eol=lf
+Dockerfile     text eol=lf
+*.Dockerfile   text eol=lf
+.gitattributes text eol=lf
