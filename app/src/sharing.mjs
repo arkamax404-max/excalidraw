@@ -12,6 +12,11 @@ export const sharePath = (identity) =>
 export const memberPath = (identity, username) =>
   sharePath(identity) ? `${sharePath(identity)}/${encodeURIComponent(username)}` : null;
 
+// The row stays visible so sharing can be discovered, but an unusable control
+// says why instead of pretending authority the server would refuse.
+export const shareHint = (identity) =>
+  sharePath(identity) ? null : "Carga un diagrama tuyo para compartirlo.";
+
 export const memberNames = (payload) => (payload?.members ?? [])
   .map((member) => (member && typeof member === "object" ? member.username : null))
   .filter((name) => typeof name === "string" && name.trim() !== "")

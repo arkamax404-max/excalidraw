@@ -158,6 +158,18 @@
   opacity: 0.6;
 }
 
+.storage-panel input:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.share-hint {
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.3;
+  color: #6b7280;
+}
+
 .section-heading {
   display: flex;
   align-items: center;

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { validUsername, sharePath, memberPath, memberNames } from "./sharing.mjs";
+import { validUsername, sharePath, memberPath, memberNames, shareHint } from "./sharing.mjs";
 
 test("only a diagram the user owns exposes sharing paths", () => {
   const owned = { kind: "file", id: "42", name: "one" };
@@ -10,6 +10,13 @@ test("only a diagram the user owns exposes sharing paths", () => {
   for (const identity of [null, undefined, { kind: "diagram", id: "42" }, { kind: "file" }]) {
     assert.equal(sharePath(identity), null);
     assert.equal(memberPath(identity, "invitado"), null);
+  }
+});
+
+test("unavailable sharing explains itself instead of hiding or inventing authority", () => {
+  assert.equal(shareHint({ kind: "file", id: "42", name: "one" }), null);
+  for (const identity of [null, undefined, { kind: "diagram", id: "42" }, { kind: "file" }]) {
+    assert.equal(shareHint(identity), "Carga un diagrama tuyo para compartirlo.");
   }
 });
 

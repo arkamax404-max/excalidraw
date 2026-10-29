@@ -136,6 +136,18 @@ Docker Compose overrides some server defaults; treat `docker-compose.yml` as the
 - Deleting a user cascades their diagrams and removes only that account-ID backup directory. Legacy username folders stay intact, even after file/account deletion; they are never automatically restored, imported or migrated. Future migration or cleanup needs separate consent.
 - The account whose username is exactly `admin` receives the user-management interface and API permissions.
 
+## Share a diagram with another user
+
+Sharing is granted per diagram, never per account: sharing one diagram gives that user access to that diagram only, not to the rest of your library.
+
+1. Sign in as the owner and select the **Servidor** button in the top-right corner to open the storage panel.
+2. Load the diagram you want to share from the **Mis diagramas** list. You must load it: sharing by name alone is not offered.
+3. Type the other user's username in the sharing row and select **Compartir**.
+
+Until a diagram you own is loaded, that row stays visible but disabled and explains itself with *Carga un diagrama tuyo para compartirlo*. Select **Accesos** to list the users who can open the current diagram and to revoke any of them; a revoked member loses access, including an open realtime connection, without reloading the page.
+
+The shared diagram then appears in the other user's **Mis diagramas** list marked as *Compartido*. A member can open, edit, and save that diagram, and edits from both sides converge through the realtime relay. A member cannot rename or delete it, and cannot share it onward: for them the sharing row stays disabled, because sharing is owner-only. Usernames must match `^[A-Za-z0-9._-]{3,50}$` and belong to an active account; the server rejects anything else before creating a membership.
+
 ## Generate a diagram with AI
 
 1. Configure `OPENROUTER_API_KEY`, `GROQ_API_KEY`, or both in `app/.env` and restart the application with `docker compose --env-file app/.env up -d --build`.

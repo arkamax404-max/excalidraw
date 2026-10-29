@@ -63,7 +63,13 @@ test("owner shares a loaded diagram from the panel and the member sees it", asyn
     await expect(sharedRow.locator(".file-delete-button")).toHaveCount(0);
     await sharedRow.locator("button.file-button").click();
     await expect(member.locator(".status")).toContainText("cargado.");
-    await expect(member.getByRole("textbox", { name: "Usuario para compartir" })).toHaveCount(0);
+    // The row stays visible so sharing is discoverable, but a member learns why
+    // it is unusable instead of the control vanishing or claiming authority.
+    await expect(member.getByRole("textbox", { name: "Usuario para compartir" })).toBeDisabled();
+    await expect(member.getByRole("button", { name: "Compartir", exact: true })).toBeDisabled();
+    await expect(member.getByRole("button", { name: "Accesos", exact: true })).toBeDisabled();
+    await expect(member.locator(".share-hint"))
+      .toHaveText("Carga un diagrama tuyo para compartirlo.");
 
     expect(errors, "Neither page may emit uncaught errors").toEqual([]);
   } finally {

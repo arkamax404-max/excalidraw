@@ -16,7 +16,7 @@ import { documentContext, renameDocument, beginDocumentOperation, documentHeader
   acknowledgeDocument, readApiResponse, documentError, normalizeDocumentName,
   beginReconciliation, canApplyServerDocument, documentTarget,
   documentPayloadName } from "./document-version.mjs";
-import { validUsername, sharePath, memberPath, memberNames } from "./sharing.mjs";
+import { validUsername, sharePath, memberPath, memberNames, shareHint } from "./sharing.mjs";
 
 const DEFAULT_FILE_NAME = "diagrama-1";
 const ADMIN_FORM_INITIAL_STATE = {
@@ -937,24 +937,26 @@ function App() {
                 </button>
               </div>
 
-              {sharePath(loadedIdentity) ? (
-                <div className="storage-secondary-row">
-                  <input
-                    aria-label="Usuario para compartir"
-                    placeholder="usuario"
-                    value={shareUsername}
-                    onChange={(event) => setShareUsername(event.target.value)}
-                    disabled={shareBusy}
-                  />
-                  <button type="button" onClick={() => void shareMember()}
-                    disabled={shareBusy || !validUsername(shareUsername)}>
-                    Compartir
-                  </button>
-                  <button type="button" onClick={() => void loadMembers(loadedIdentity)}
-                    disabled={shareBusy}>
-                    Accesos
-                  </button>
-                </div>
+              <div className="storage-secondary-row">
+                <input
+                  aria-label="Usuario para compartir"
+                  placeholder="usuario"
+                  value={shareUsername}
+                  onChange={(event) => setShareUsername(event.target.value)}
+                  disabled={shareBusy || !sharePath(loadedIdentity)}
+                />
+                <button type="button" onClick={() => void shareMember()}
+                  disabled={shareBusy || !sharePath(loadedIdentity) || !validUsername(shareUsername)}>
+                  Compartir
+                </button>
+                <button type="button" onClick={() => void loadMembers(loadedIdentity)}
+                  disabled={shareBusy || !sharePath(loadedIdentity)}>
+                  Accesos
+                </button>
+              </div>
+
+              {shareHint(loadedIdentity) ? (
+                <p className="share-hint">{shareHint(loadedIdentity)}</p>
               ) : null}
 
               {members.length > 0 ? (
